@@ -4,48 +4,37 @@ pragma solidity ^0.8.20;
 /**
  * @title IReferralVault
  * @notice Interface the Diamond's logic facets use to drive the ReferralVault
- *         (normal external CALL). The vault is the approved "pool" caller's target.
+ *         (a normal external CALL). The facets pass the investor's deposited
+ *         amount and code; the vault keeps the ARTHA and tracks the reward.
  *
- *  Call sites (in your deposit/withdraw flow):
- *    - On a referred deposit settling   -> openPosition(...)   (returns an id to store)
- *    - On the investor adding funds      -> increasePosition(id, addedPrincipal)
- *    - On a partial withdrawal           -> decreasePosition(id, removedPrincipal)
- *    - On a full withdrawal              -> closePosition(id)
+ *  Call sites in your deposit/withdraw flow (msg.sender must be the Diamond,
+ *  approved via ReferralVault.setPool(diamond, true)):
  *
- *  IMPORTANT: openPosition starts the reward clock but credits nothing. Rewards
- *  are only settled (credited) by increase/decrease/close (or settlePosition),
- *  i.e. NOT on the first investment — matching the intended design.
+ *    - When a referred deposit settles        -> notifyDeposit(code, investor, principal)
+ *    - When a referred position shrinks/exits  -> notifyWithdraw(code, principal)
+ *
+ *  Rewards accrue on wall-clock time while the referred capital is active, so the
+ *  code OWNER can claim any time via claim(...) without the investor acting.
  */
 interface IReferralVault {
-    /// @return id The new position id (0 if no valid referral, e.g. self-referral).
-    function openPosition(
-        address investor,
-        uint256 poolId,
-        uint256 principal,
-        uint256 termDuration, // 0 = normal/flexible; >0 = fixed-term (accrual capped at term)
-        bytes32 code
-    ) external returns (uint256 id);
+    // ---- driven by the Diamond on deposit / withdraw ----
+    function notifyDeposit(bytes32 code, address investor, uint256 principal) external;
 
-    function increasePosition(uint256 id, uint256 addPrincipal) external;
+    function notifyWithdraw(bytes32 code, uint256 principal) external;
 
-    function decreasePosition(uint256 id, uint256 removePrincipal) external;
+    // ---- anyone may push a code's accrual into its claimable balance ----
+    function sync(bytes32 code) external;
 
-    function closePosition(uint256 id) external;
-
-    /// @notice Permissionless: push a position's accrued reward into balances.
-    function settlePosition(uint256 id) external;
-
-    // ---- claims (called directly by investors / code owners) ----
-
-    function claimInvestorRewards(address to) external returns (uint256 amount);
-
-    function claimOwnerRewards(bytes32 code, address to, uint256 amount) external;
+    // ---- called directly by the code's current owner ----
+    function claim(bytes32 code, address to, uint256 amount) external;
 
     // ---- views ----
+    function pendingReward(bytes32 code) external view returns (uint256);
 
-    function pendingInvestor(address investor) external view returns (uint256);
+    function referredBalance(bytes32 code) external view returns (uint256);
 
-    function pendingOwner(bytes32 code) external view returns (uint256);
-
-    function previewPosition(uint256 id) external view returns (uint256 investorPart, uint256 ownerPart);
+    function codeInfo(bytes32 code)
+        external
+        view
+        returns (address owner, uint256 balance, uint256 claimable, uint256 lifetimeClaimed);
 }
