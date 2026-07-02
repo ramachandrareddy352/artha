@@ -1,352 +1,296 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "lib/openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-import "lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
-import "./VaultManager.sol";
+import "./ReferralSystem.sol";
 
-/// @dev Minimal view the vault needs from the standalone ReferralSystem registry.
-interface IReferralSystem {
-    function getCodeOwner(bytes32 code) external view returns (address);
-    function isValidCode(bytes32 code) external view returns (bool);
-    function deactivateCode(bytes32 code) external;
-}
-
-/*//////////////////////////////////////////////////////////////////////////
-                               ReferralVault
-//////////////////////////////////////////////////////////////////////////*/
 /**
  * @title  ReferralVault
- * @notice Holds the ARTHA earmarked for referral rewards and pays code OWNERS
- *         based on HOW MUCH referred capital they bring and HOW LONG it stays.
- *         The code owner can withdraw at ANY time — they never have to wait for
- *         the investor to do anything.
+ * @notice Top layer of the chain — holds the ARTHA and pays code OWNERS based on
+ *         HOW MUCH referred capital they bring and HOW LONG it stays. Because it
+ *         inherits ReferralSystem (registry) and ReferralVaultManager (admin), it
+ *         reads codeOwner / traderToCode directly, with no external calls.
+ *
+ *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault  (deployed)
  *
  *  ─────────────────────────────────────────────────────────────────────────
- *  THE MECHANISM: one global accumulator, updated only when something changes.
+ *  THREE POOLS, DIFFERENT RATES (high risk => higher rate => more reward).
+ *  Everything is tracked PER POOL: each pool has its own rate, its own
+ *  accumulator, and its own per-code balances. poolId: 0=LOW, 1=MEDIUM, 2=HIGH.
  *
- *  We never loop over codes and never run a daily job. Instead we keep a single
- *  running number, `accArthaPerToken` = "ARTHA earned per 1 USDC of referred
- *  capital, integrated over time". It advances by (rate x elapsed time):
- *
+ *  THE MECHANISM (per pool): one accumulator, updated only when something changes.
  *      accArthaPerToken += currentRate * dt * ACC / (USDC_UNIT * YEAR)
+ *      earned(code) = referredBalance(code) * accArthaPerToken / ACC - rewardDebt
+ *  More capital -> bigger balance; more time -> bigger accumulator. No daily cron,
+ *  O(1) gas, and the OWNER can claim any time (claim settles to `now` first).
  *
- *  Each code stores its referred balance and a checkpoint (`rewardDebt`). Its
- *  earned amount at any moment is:
+ *  RATE CHANGE: setRate() calls _updateIndex() FIRST (banks the old rate up to
+ *  now), then writes the new rate — so old accrual keeps the old rate and only
+ *  future accrual uses the new one. Zero retroactivity.
  *
- *      earned = referredBalance * accArthaPerToken / ACC - rewardDebt
+ *  DECIMALS: balances are raw USDC (6 dp). A rate is ARTHA-wei per ONE whole USDC
+ *  per year (1e18 = "1.0 ARTHA/USDC/yr"); USDC_UNIT (1e6) converts raw -> whole.
  *
- *  Because the accumulator already folds in "rate x time", multiplying by the
- *  code's balance gives exactly "amount x time x rate". More capital -> bigger
- *  balance; more time -> bigger accumulator. Both increase the reward for free,
- *  with O(1) gas and no cron.
- *
- *  RATE CHANGES (different reward ratio per day/week):
- *  The rate is ONE variable. `setRate` calls `_updateIndex()` FIRST, which banks
- *  everything the OLD rate earned up to that instant into the accumulator; only
- *  then is the new rate written, so it applies purely going forward. Old rate up
- *  to the change, new rate after — zero retroactivity.
- *
- *  ─────────────────────────────────────────────────────────────────────────
- *  WORKED EXAMPLE (matches the hand calculation, 1 month per step = 1/12 year):
- *
- *    User-1 deposits 1,000 USDC under code C.        rate = 1.0 ARTHA/yr/USDC
- *    +1 month -> rate set to 0.5
- *    +1 month -> User-2 deposits 1,000 USDC (code C) [balance now 2,000]
- *    +1 month -> rate set to 0.75
- *    +1 month -> owner withdraws
- *
- *    Segment payouts = balance * rate * (1/12):
- *      A: 1,000 * 1.00 /12 = 83.3333
- *      B: 1,000 * 0.50 /12 = 41.6667
- *      C: 2,000 * 0.50 /12 = 83.3333
- *      D: 2,000 * 0.75 /12 = 125.0000
- *    Owner total = 333.33 ARTHA  <-- the vault produces exactly this.
- *  ─────────────────────────────────────────────────────────────────────────
- *
- *  DECIMALS: referred balances are raw USDC (6 dp). The rate is ARTHA-wei per
- *  ONE whole USDC per year (e.g. 1e18 == "1.0 ARTHA per USDC per year"). The
- *  USDC_UNIT (1e6) in the formula converts raw balance -> whole USDC.
- *
- *  FUNDING: this vault does NOT mint. Mint ARTHA into it up front; claims just
- *  transfer from the balance. Admin can sweep genuine excess ARTHA, or any token
- *  sent here by mistake, via one `rescue`.
+ *  FUNDING: does NOT mint. Mint ARTHA into this contract up front; claims transfer
+ *  from balance. Admin can sweep genuine excess ARTHA or any stray token via rescue.
  */
-contract ReferralVault is VaultManager, ReentrancyGuard {
+contract ReferralVault is ReferralSystem, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /*//////////////////////////////////////////////////////////////
-                                CONSTANTS
-    //////////////////////////////////////////////////////////////*/
+    uint256 public constant ACC = 1e18;      // accumulator precision
+    uint256 public constant YEAR = 365 days; // seconds per year
+    uint256 public constant USDC_UNIT = 1e6; // one whole USDC (6 decimals)
 
-    uint256 public constant ACC = 1e18;               // accumulator precision
-    uint256 public constant YEAR = 365 days;          // seconds per year
-    uint256 public constant USDC_UNIT = 1e6;          // 1 whole USDC (6 decimals)
+    uint8 public constant POOL_LOW = 0;
+    uint8 public constant POOL_MEDIUM = 1;
+    uint8 public constant POOL_HIGH = 2;
+    uint8 public constant POOL_COUNT = 3;
 
-    /*//////////////////////////////////////////////////////////////
-                                IMMUTABLES
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice The ARTHA token this vault distributes.
     IERC20 public immutable artha;
-
-    /*//////////////////////////////////////////////////////////////
-                         REWARD-TRACKING STATE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice The registry the vault reads code/owner from.
-    IReferralSystem public referralSystem;
-
-    /// @notice Reward rate: ARTHA-wei per ONE whole USDC of referred capital per
-    ///         year. Example: 1e18 = 1.0 ARTHA/yr/USDC, 5e17 = 0.5, 75e16 = 0.75.
-    uint256 public currentRate;
-
-    /// @notice THE reward accumulator (ARTHA per USDC of referred capital, scaled
-    ///         by ACC), advanced lazily by _updateIndex().
-    uint256 public accArthaPerToken;
-
-    /// @notice Last time the accumulator was advanced.
-    uint256 public lastUpdate;
-
-    /// @notice Total referred USDC currently active across all codes (info/guard).
-    uint256 public totalReferred;
-
-    // ---- per-code accounting ----
-    mapping(bytes32 => uint256) public referredBalance; // active referred USDC (raw 6dp) under a code
-    mapping(bytes32 => uint256) public rewardDebt;      // checkpoint: balance * acc / ACC at last settle
-    mapping(bytes32 => uint256) public earned;          // settled, claimable ARTHA for the code
-    mapping(bytes32 => uint256) public claimed;         // lifetime ARTHA claimed by the code (tracking)
-
-    // ---- vault-wide totals (for rescue safety) ----
-    uint256 public totalEarnedArtha;   // cumulative ARTHA ever settled into `earned`
-    uint256 public totalClaimedArtha;  // cumulative ARTHA ever claimed
-
-    /*//////////////////////////////////////////////////////////////
-                                 EVENTS
-    //////////////////////////////////////////////////////////////*/
-
-    event ReferralSystemUpdated(address oldSystem, address newSystem);
-    event RateUpdated(uint256 oldRate, uint256 newRate);
-    event Referred(bytes32 indexed code, uint256 principal, uint256 newBalance);
-    event Unreferred(bytes32 indexed code, uint256 principal, uint256 newBalance);
-    event RewardSettled(bytes32 indexed code, uint256 pending, uint256 totalEarned);
-    event RewardClaimed(bytes32 indexed code, address indexed owner, address to, uint256 amount);
-    event Rescued(address indexed token, address to, uint256 amount);
-
-    /*//////////////////////////////////////////////////////////////
-                               CONSTRUCTOR
-    //////////////////////////////////////////////////////////////*/
-
-    constructor(address _artha, address _admin, address _referralSystem) VaultManager(_admin) {
-        require(_artha != address(0), "INVALID_ARTHA");
-        require(_referralSystem != address(0), "INVALID_REFERRAL_SYSTEM");
-        artha = IERC20(_artha);
-        referralSystem = IReferralSystem(_referralSystem);
-        lastUpdate = block.timestamp; // start the clock at deployment
+ 
+    /// @notice Per-pool global reward state.
+    struct PoolState {
+        uint256 currentRate;      // ARTHA-wei per whole USDC per year
+        uint256 accArthaPerToken; // accumulator (scaled by ACC)
+        uint256 lastUpdate;       // last time the accumulator advanced
+        uint256 totalReferred;    // total active referred USDC in this pool
     }
 
-    /*//////////////////////////////////////////////////////////////
-                        CORE: ACCUMULATOR + SETTLE
-    //////////////////////////////////////////////////////////////*/
+    /// @notice Per-pool, per-code account.
+    struct CodeAccount {
+        uint256 referredBalance;  // active referred USDC (raw 6dp)
+        uint256 rewardDebt;       // checkpoint: balance * acc / ACC at last settle
+        uint256 earned;           // settled, claimable ARTHA
+        uint256 claimed;          // lifetime claimed ARTHA (tracking)
+    }
 
-    /// @dev Advance the global accumulator using the CURRENT rate over the time
-    ///      since the last update. Because `setRate` calls this before changing
-    ///      the rate, the rate is always constant across [lastUpdate, now].
-    function _updateIndex() internal {
+    /// @notice poolId => pool state.
+    mapping(uint8 => PoolState) public poolState;
+
+    /// @notice poolId => code => account.
+    mapping(uint8 => mapping(bytes32 => CodeAccount)) public codeAccount;
+
+    // ---- vault-wide totals (rescue safety) ----
+    uint256 public totalEarnedArtha;
+    uint256 public totalClaimedArtha;
+
+    event RateUpdated(uint8 indexed poolId, uint256 oldRate, uint256 newRate);
+    event Referred(uint8 indexed poolId, bytes32 indexed code, uint256 principal, uint256 newBalance);
+    event Unreferred(uint8 indexed poolId, bytes32 indexed code, uint256 principal, uint256 newBalance);
+    event RewardSettled(uint8 indexed poolId, bytes32 indexed code, uint256 pending);
+    event RewardClaimed(uint8 indexed poolId, bytes32 indexed code, address indexed owner, address to, uint256 amount);
+    event Rescued(address indexed token, address to, uint256 amount);
+
+    constructor(address _artha, address _admin) ReferralSystem(_admin) {
+        require(_artha != address(0), "INVALID_ARTHA");
+        artha = IERC20(_artha);
+        // Start each pool's clock at deployment so the first rate period is measured
+        // from now (not from timestamp 0).
+        uint256 t = block.timestamp;
+        poolState[POOL_LOW].lastUpdate = t;
+        poolState[POOL_MEDIUM].lastUpdate = t;
+        poolState[POOL_HIGH].lastUpdate = t;
+    }
+
+    function _validPool(uint8 poolId) private pure {
+        require(poolId < POOL_COUNT, "INVALID_POOL_ID");
+    }
+
+    /// @dev Advance a pool's accumulator at its CURRENT rate over [lastUpdate, now].
+    ///      Safe because setRate() calls this before changing the rate.
+    function _updateIndex(uint8 poolId) internal {
+        PoolState storage p = poolState[poolId];
         uint256 nowTs = block.timestamp;
-        if (nowTs <= lastUpdate) return;
-
-        if (currentRate != 0) {
-            uint256 dt = nowTs - lastUpdate;
-            // acc += rate * dt * ACC / (USDC_UNIT * YEAR)   (multiply first, divide last)
-            accArthaPerToken += (currentRate * dt * ACC) / (USDC_UNIT * YEAR);
+        if (nowTs <= p.lastUpdate) return;
+        if (p.currentRate != 0) {
+            uint256 dt = nowTs - p.lastUpdate;
+            p.accArthaPerToken += (p.currentRate * dt * ACC) / (USDC_UNIT * YEAR);
         }
-        lastUpdate = nowTs;
+        p.lastUpdate = nowTs;
     }
 
     /// @dev Bank a code's accrued reward into `earned` and refresh its checkpoint.
-    ///      Never changes the balance — callers change the balance around it.
-    function _settle(bytes32 code) internal {
-        _updateIndex();
-        uint256 accumulated = (referredBalance[code] * accArthaPerToken) / ACC;
-        uint256 pending = accumulated - rewardDebt[code];
+    function _settle(uint8 poolId, bytes32 code) internal {
+        _updateIndex(poolId);
+        CodeAccount storage a = codeAccount[poolId][code];
+        uint256 accumulated = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC;
+        uint256 pending = accumulated - a.rewardDebt;
         if (pending != 0) {
-            earned[code] += pending;
+            a.earned += pending;
             totalEarnedArtha += pending;
-            emit RewardSettled(code, pending, earned[code]);
+            emit RewardSettled(poolId, code, pending);
         }
-        rewardDebt[code] = accumulated;
+        a.rewardDebt = accumulated;
     }
 
-    /*//////////////////////////////////////////////////////////////
-              POSITION HOOKS (called by the Diamond / facets)
-              onlyPool == the approved caller; see VaultManager
-    //////////////////////////////////////////////////////////////*/
-
     /**
-     * @notice A referred deposit was made: grow the code's referred balance.
-     *         Settles the OLD balance first, then adds, then re-checkpoints so
-     *         the new capital only earns from now on.
-     * @param  code      The referral code the investor used.
-     * @param  investor  The depositor (used only to block self-referral).
-     * @param  principal The referred USDC amount (raw, 6 decimals).
+     * @notice A referred deposit into `poolId`. The code is looked up from the
+     *         investor's stored traderToCode — the investor never resends it.
+     * @param  poolId    0=LOW, 1=MEDIUM, 2=HIGH.
+     * @param  investor  The depositor.
+     * @param  principal Referred USDC amount (raw, 6 decimals).
      */
-    function notifyDeposit(bytes32 code, address investor, uint256 principal)
+    function notifyDeposit(uint8 poolId, address investor, uint256 principal)
         external
         onlyPool
         whenNotPaused
     {
-        if (code == bytes32(0) || principal == 0) return; // no referral on this deposit
-        address owner = referralSystem.getCodeOwner(code);
-        if (owner == address(0) || owner == investor) return; // invalid code or self-referral
+        _validPool(poolId);
+        if (principal == 0) return;
 
-        _settle(code);                       // bank accrual at the OLD balance
-        referredBalance[code] += principal;  // grow
-        totalReferred += principal;
-        rewardDebt[code] = (referredBalance[code] * accArthaPerToken) / ACC; // re-checkpoint at new balance
+        bytes32 code = traderToCode[investor];
+        if (code == bytes32(0)) return;                       // investor set no code
+        address owner = codeOwner[code];
+        if (owner == address(0) || owner == investor) return; // deactivated / self-referral
 
-        emit Referred(code, principal, referredBalance[code]);
+        _settle(poolId, code);                                // bank at OLD balance
+        CodeAccount storage a = codeAccount[poolId][code];
+        a.referredBalance += principal;
+        poolState[poolId].totalReferred += principal;
+        a.rewardDebt = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC; // re-checkpoint
+
+        emit Referred(poolId, code, principal, a.referredBalance);
     }
 
     /**
-     * @notice A referred position shrank or fully exited: reduce the code's
-     *         referred balance so it stops earning on the withdrawn capital.
-     * @param  code      The referral code.
-     * @param  principal The USDC amount leaving (raw, 6 decimals).
+     * @notice A referred position in `poolId` shrinks or fully exits.
+     * @param  poolId    0=LOW, 1=MEDIUM, 2=HIGH.
+     * @param  investor  The withdrawing depositor (its stored code is reduced).
+     * @param  principal USDC leaving (raw, 6 decimals).
      */
-    function notifyWithdraw(bytes32 code, uint256 principal) external onlyPool whenNotPaused {
-        if (code == bytes32(0) || principal == 0) return;
-        uint256 bal = referredBalance[code];
+    function notifyWithdraw(uint8 poolId, address investor, uint256 principal)
+        external
+        onlyPool
+        whenNotPaused
+    {
+        _validPool(poolId);
+        if (principal == 0) return;
+
+        bytes32 code = traderToCode[investor];
+        if (code == bytes32(0)) return;
+
+        CodeAccount storage a = codeAccount[poolId][code];
+        uint256 bal = a.referredBalance;
         if (bal == 0) return;
 
-        _settle(code); // bank accrual up to now first
+        _settle(poolId, code);                        // bank up to now first
 
         uint256 dec = principal > bal ? bal : principal; // clamp (defensive)
-        referredBalance[code] = bal - dec;
-        totalReferred -= dec;
-        rewardDebt[code] = (referredBalance[code] * accArthaPerToken) / ACC;
+        a.referredBalance = bal - dec;
+        poolState[poolId].totalReferred -= dec;
+        a.rewardDebt = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC;
 
-        emit Unreferred(code, dec, referredBalance[code]);
+        emit Unreferred(poolId, code, dec, a.referredBalance);
     }
 
-    /// @notice Permissionless: bring a code's `earned` up to date (e.g. so the
-    ///         owner sees/claims the latest without any deposit/withdraw happening).
-    function sync(bytes32 code) external {
-        _settle(code);
+    /// @notice Permissionless: bring a code's `earned` up to date in a pool.
+    function sync(uint8 poolId, bytes32 code) external {
+        _validPool(poolId);
+        _settle(poolId, code);
     }
-
-    /*//////////////////////////////////////////////////////////////
-                                 RATE
-    //////////////////////////////////////////////////////////////*/
 
     /**
-     * @notice Set the reward rate. CRITICAL: banks the old rate up to `now`
-     *         BEFORE writing the new one, so past accrual keeps the old rate and
-     *         only future accrual uses the new rate.
-     * @param  newRate ARTHA-wei per whole USDC per year (e.g. 5e17 = 0.5).
+     * @notice Set a pool's reward rate. Banks the old rate up to `now` FIRST, so
+     *         the change is not retroactive. Higher pool = higher rate.
+     * @param  poolId  0=LOW, 1=MEDIUM, 2=HIGH.
+     * @param  newRate ARTHA-wei per whole USDC per year (e.g. 2e17 = 0.2, 1e18 = 1.0).
      */
-    function setRate(uint256 newRate) external onlyVaultAdmin {
-        _updateIndex(); // <-- freeze everything the OLD rate earned, up to this instant
-        uint256 old = currentRate;
-        currentRate = newRate;
-        emit RateUpdated(old, newRate);
+    function setRate(uint8 poolId, uint256 newRate) external onlyReferralVaultManager {
+        _validPool(poolId);
+        _updateIndex(poolId); // freeze old-rate accrual up to this instant
+        uint256 old = poolState[poolId].currentRate;
+        poolState[poolId].currentRate = newRate;
+        emit RateUpdated(poolId, old, newRate);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                                 CLAIM
-    //////////////////////////////////////////////////////////////*/
-
-    /**
-     * @notice The code's CURRENT owner withdraws its ARTHA rewards. Can be called
-     *         any time — it settles to `now` first, so nothing is left on the table.
-     * @param  code   The code to claim for.
-     * @param  to     Where to send the ARTHA.
-     * @param  amount How much to withdraw (<= claimable).
-     */
-    function claim(bytes32 code, address to, uint256 amount) external nonReentrant whenNotPaused {
+    /// @notice The code's CURRENT owner withdraws its ARTHA from one pool.
+    function claim(uint8 poolId, bytes32 code, address to, uint256 amount)
+        public
+        nonReentrant
+        whenNotPaused
+    {
+        _validPool(poolId);
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
-        require(referralSystem.getCodeOwner(code) == msg.sender, "NOT_CODE_OWNER");
+        require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
 
-        _settle(code); // bring `earned[code]` current up to now
+        _settle(poolId, code); // bring current to now
+        CodeAccount storage a = codeAccount[poolId][code];
+        require(a.earned >= amount, "INSUFFICIENT_REWARDS");
 
-        uint256 bal = earned[code];
-        require(bal >= amount, "INSUFFICIENT_REWARDS");
-
-        earned[code] = bal - amount;         // effect (checks-effects-interactions)
-        claimed[code] += amount;
+        a.earned -= amount;               // effect (checks-effects-interactions)
+        a.claimed += amount;
         totalClaimedArtha += amount;
-        artha.safeTransfer(to, amount);      // interaction
-        emit RewardClaimed(code, msg.sender, to, amount);
+        artha.safeTransfer(to, amount);   // transfer rewards
+        emit RewardClaimed(poolId, code, msg.sender, to, amount);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                            ADMIN FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
+    /// @notice Convenience: claim the full earned balance from every pool at once.
+    function claimAll(bytes32 code, address to) external {
+        require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
+        for (uint8 i = 0; i < POOL_COUNT; i++) {
+            _settle(i, code);
+            uint256 amt = codeAccount[i][code].earned;
+            if (amt != 0) {
+                claim(i, code, to, amt); // reuses owner check + transfer (nonReentrant per call)
+            }
+        }
+    }
 
-    /// @notice Repoint to a new referral registry.
-    function setReferralSystem(address _newReferralSystem) external onlyVaultAdmin {
-        require(_newReferralSystem != address(0), "INVALID_REFERRAL_SYSTEM");
-        address old = address(referralSystem);
-        referralSystem = IReferralSystem(_newReferralSystem);
-        emit ReferralSystemUpdated(old, _newReferralSystem);
+    /**
+     * @notice Deactivate a code. Requires it to be fully wound down first: no
+     *         active referred balance and no unclaimed rewards in ANY pool. This
+     *         Executed by code owner or admin.
+     */
+    function deactivateCode(bytes32 code) external {
+        for (uint8 i = 0; i < POOL_COUNT; i++) {
+            _settle(i, code);
+            CodeAccount storage a = codeAccount[i][code];
+            require(a.referredBalance == 0, "HAS_ACTIVE_BALANCE");
+            require(a.earned == 0, "HAS_UNCLAIMED_REWARDS");
+        }
+        _deactivateCode(code); // parent (registry) internal
     }
 
     /**
      * @notice ONE function to recover funds the vault should not keep:
-     *           - excess ARTHA (above what is owed), or
-     *           - any other token sent here by mistake.
-     * @dev    For ARTHA, capped to `balance - settledUnclaimed` so it can never
-     *         touch rewards already credited to codes. NOTE: reward still accruing
-     *         on active codes is NOT reserved here, so keep the vault funded above
-     *         ongoing accrual and only sweep clear excess.
+     *           - excess ARTHA (above what is owed), or any other stray token.
+     * @dev    For ARTHA, capped to `balance - settledUnclaimed`, so it can never
+     *         touch rewards already credited. NOTE: reward still accruing on active
+     *         codes is not reserved here — keep the vault funded above ongoing
+     *         accrual and only sweep clear excess.
      */
-    function rescue(address token, address to, uint256 amount) external onlyVaultAdmin {
+    function rescue(address token, address to, uint256 amount) external onlyReferralVaultManager {
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
-
         if (token == address(artha)) {
-            uint256 owed = totalEarnedArtha - totalClaimedArtha; // settled-but-unclaimed
+            uint256 owed = totalEarnedArtha - totalClaimedArtha;
             uint256 bal = artha.balanceOf(address(this));
             uint256 excess = bal > owed ? bal - owed : 0;
             require(amount <= excess, "EXCEEDS_EXCESS");
         }
-
         IERC20(token).safeTransfer(to, amount);
         emit Rescued(token, to, amount);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                                 VIEWS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Live claimable reward for a code = settled + not-yet-settled accrual.
-    function pendingReward(bytes32 code) public view returns (uint256) {
-        uint256 accNow = accArthaPerToken;
-        if (block.timestamp > lastUpdate && currentRate != 0) {
-            uint256 dt = block.timestamp - lastUpdate;
-            accNow += (currentRate * dt * ACC) / (USDC_UNIT * YEAR);
+    /// @notice Live claimable reward for a code in a pool (settled + accruing).
+    function pendingReward(uint8 poolId, bytes32 code) public view returns (uint256) {
+        PoolState storage p = poolState[poolId];
+        uint256 accNow = p.accArthaPerToken;
+        if (block.timestamp > p.lastUpdate && p.currentRate != 0) {
+            uint256 dt = block.timestamp - p.lastUpdate;
+            accNow += (p.currentRate * dt * ACC) / (USDC_UNIT * YEAR);
         }
-        uint256 accumulated = (referredBalance[code] * accNow) / ACC;
-        uint256 unsettled = accumulated - rewardDebt[code];
-        return earned[code] + unsettled;
+        CodeAccount storage a = codeAccount[poolId][code];
+        uint256 accumulated = (a.referredBalance * accNow) / ACC;
+        return a.earned + (accumulated - a.rewardDebt);
     }
 
-    /// @notice ARTHA the admin could currently rescue (balance minus settled owed).
-    function rescuableArtha() external view returns (uint256) {
-        uint256 owed = totalEarnedArtha - totalClaimedArtha;
-        uint256 bal = artha.balanceOf(address(this));
-        return bal > owed ? bal - owed : 0;
+    /// @notice Total live claimable for a code across all three pools.
+    function pendingRewardAllPools(bytes32 code) external view returns (uint256 total) {
+        for (uint8 i = 0; i < POOL_COUNT; i++) {
+            total += pendingReward(i, code);
+        }
     }
 
-    /// @notice Compact snapshot for a code.
-    function codeInfo(bytes32 code)
-        external
-        view
-        returns (address owner, uint256 balance, uint256 claimable, uint256 lifetimeClaimed)
-    {
-        owner = referralSystem.getCodeOwner(code);
-        balance = referredBalance[code];
-        claimable = pendingReward(code);
-        lifetimeClaimed = claimed[code];
-    }
 }

@@ -1,40 +1,59 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./IReferralSystem.sol";
+
 /**
  * @title IReferralVault
- * @notice Interface the Diamond's logic facets use to drive the ReferralVault
- *         (a normal external CALL). The facets pass the investor's deposited
- *         amount and code; the vault keeps the ARTHA and tracks the reward.
+ * @notice Full external surface of the deployed ReferralVault (extends the
+ *         registry + manager surfaces). This is the interface the Diamond's
+ *         facets import to drive deposits/withdrawals, and that investors /
+ *         code owners use to set codes and claim.
+ * 
+ *  poolId convention: 0 = LOW, 1 = MEDIUM, 2 = HIGH.
  *
- *  Call sites in your deposit/withdraw flow (msg.sender must be the Diamond,
- *  approved via ReferralVault.setPool(diamond, true)):
- *
- *    - When a referred deposit settles        -> notifyDeposit(code, investor, principal)
- *    - When a referred position shrinks/exits  -> notifyWithdraw(code, principal)
- *
- *  Rewards accrue on wall-clock time while the referred capital is active, so the
- *  code OWNER can claim any time via claim(...) without the investor acting.
+ *  Diamond call sites (msg.sender must be an approved pool = the Diamond):
+ *     - referred deposit  -> notifyDeposit(poolId, investor, principal)
+ *     - referred exit      -> notifyWithdraw(poolId, investor, principal)
+ *  (The code is resolved from the investor's one-time traderToCode.)
  */
-interface IReferralVault {
-    // ---- driven by the Diamond on deposit / withdraw ----
-    function notifyDeposit(bytes32 code, address investor, uint256 principal) external;
+interface IReferralVault is IReferralSystem {
+    // constants (exposed as getters)
+    function POOL_LOW() external view returns (uint8);
+    function POOL_MEDIUM() external view returns (uint8);
+    function POOL_HIGH() external view returns (uint8);
+    function POOL_COUNT() external view returns (uint8);
+    function artha() external view returns (address);
 
-    function notifyWithdraw(bytes32 code, uint256 principal) external;
-
-    // ---- anyone may push a code's accrual into its claimable balance ----
-    function sync(bytes32 code) external;
-
-    // ---- called directly by the code's current owner ----
-    function claim(bytes32 code, address to, uint256 amount) external;
-
-    // ---- views ----
-    function pendingReward(bytes32 code) external view returns (uint256);
-
-    function referredBalance(bytes32 code) external view returns (uint256);
-
-    function codeInfo(bytes32 code)
+    // per-pool + per-code state (struct getters return tuples)
+    function poolState(uint8 poolId)
         external
         view
-        returns (address owner, uint256 balance, uint256 claimable, uint256 lifetimeClaimed);
+        returns (uint256 currentRate, uint256 accArthaPerToken, uint256 lastUpdate, uint256 totalReferred);
+
+    function codeAccount(uint8 poolId, bytes32 code)
+        external
+        view
+        returns (uint256 referredBalance, uint256 rewardDebt, uint256 earned, uint256 claimed);
+
+    function totalEarnedArtha() external view returns (uint256);
+    function totalClaimedArtha() external view returns (uint256);
+
+    // hooks (from the Diamond)
+    function notifyDeposit(uint8 poolId, address investor, uint256 principal) external;
+    function notifyWithdraw(uint8 poolId, address investor, uint256 principal) external;
+    function sync(uint8 poolId, bytes32 code) external;
+
+    // admin
+    function setRate(uint8 poolId, uint256 newRate) external;
+    function deactivateCode(bytes32 code) external;
+    function rescue(address token, address to, uint256 amount) external;
+
+    // owner claims
+    function claim(uint8 poolId, bytes32 code, address to, uint256 amount) external;
+    function claimAll(bytes32 code, address to) external;
+
+    // views
+    function pendingReward(uint8 poolId, bytes32 code) external view returns (uint256);
+    function pendingRewardAllPools(bytes32 code) external view returns (uint256);
 }

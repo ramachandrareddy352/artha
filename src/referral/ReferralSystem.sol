@@ -1,93 +1,48 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/*//////////////////////////////////////////////////////////////////////////
-                               ReferralSystem
-//////////////////////////////////////////////////////////////////////////*/
+import "./ReferralVaultManager.sol";
+
 /**
  * @title  ReferralSystem
- * @notice Standalone referral REGISTRY. It owns all its storage here (not a
- *         Diamond facet) and holds no money. It only answers "who owns this code".
+ * @notice The referral REGISTRY layer. It knows "who owns each code" and "which
+ *         code an investor uses". It holds no money. Second layer of the chain:
  *
- *  KEY DECISION — CODES ARE CREATED BY ADMIN ONLY.
- *  If anyone could mint a code, an investor could create a code, then deposit
- *  from a second wallet using it, and farm referral rewards on their own money.
- *  By making `createCode` admin-only, that attack is impossible: an investor
- *  cannot obtain a code to refer themselves. (The ReferralVault also blocks the
+ *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault
+ *
+ *  KEY DECISION — CODES ARE CREATED BY THE ADMIN ONLY.
+ *  The protocol runs offline events and hands codes to active participants, which
+ *  builds community trust. Users cannot self-generate codes, so an investor cannot
+ *  mint a code and refer their own second wallet. (The vault layer also blocks the
  *  degenerate self-referral where owner == depositor, as defense-in-depth.)
  *
- *  The ReferralVault reads this registry through IReferralSystem to (a) validate
- *  a code on deposit and (b) check the current owner on claim.
+ *  INVESTOR SETS THEIR CODE ONCE.
+ *  Instead of passing a referral code on every deposit, an investor calls
+ *  setTraderCode(code) a single time. Every future deposit automatically uses it.
+ *  It is set-once (permanent) on purpose: rewards are tracked per-code, so letting
+ *  someone switch codes mid-way would misattribute their already-referred capital.
+ * Note: After the protocol allocated referral rewards are completed then all codes are deactivated and the referral system is retired. The referral system is not a permanent feature of the protocol.
+ * It only exists to incentivize early adoption and community building. After the referral system is retired, the referral vault will be paused and all remaining ARTHA in the vault will be sent to the protocol treasury.
  */
-contract ReferralSystem {
-    /*//////////////////////////////////////////////////////////////
-                                 STORAGE
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Administrator. The ONLY address that can mint codes and promote.
-    address public admin;
-
+contract ReferralSystem is ReferralVaultManager {
     /// @notice code => current owner (address(0) means "no code / deactivated").
     mapping(bytes32 => address) public codeOwner;
 
     /// @notice owner => the one code they hold (reverse lookup).
     mapping(address => bytes32) public ownerToCode;
 
-    /// @notice Addresses allowed to deactivate codes (e.g. the ReferralVault).
-    mapping(address => bool) public isHandler;
+    /// @notice investor => the code they use for all deposits (set once, permanent).
+    mapping(address => bytes32) public traderToCode;
 
-    /*//////////////////////////////////////////////////////////////
-                                 EVENTS
-    //////////////////////////////////////////////////////////////*/
-
-    event AdminTransferred(address oldAdmin, address newAdmin);
-    event HandlerUpdated(address handler, bool status);
     event CodeCreated(bytes32 indexed code, address indexed owner);
     event CodeTransferred(bytes32 indexed code, address indexed oldOwner, address indexed newOwner);
     event CodeDeactivated(bytes32 indexed code, address indexed owner);
+    event TraderCodeSet(address indexed trader, bytes32 indexed code);
 
-    /*//////////////////////////////////////////////////////////////
-                                MODIFIERS
-    //////////////////////////////////////////////////////////////*/
+    constructor(address _admin) ReferralVaultManager(_admin) {}
 
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "NOT_ADMIN");
-        _;
-    }
-
-    modifier onlyHandler() {
-        require(isHandler[msg.sender], "NOT_HANDLER");
-        _;
-    }
-
-    constructor(address _admin) {
-        require(_admin != address(0), "INVALID_ADMIN");
-        admin = _admin;
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                            ADMIN FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-
-    function transferAdmin(address _newAdmin) external onlyAdmin {
-        require(_newAdmin != address(0), "INVALID_ADMIN");
-        admin = _newAdmin;
-        emit AdminTransferred(msg.sender, _newAdmin);
-    }
-
-    /// @notice Allow/deny an address (the ReferralVault) to deactivate codes.
-    function updateHandler(address _handler, bool _status) external onlyAdmin {
-        require(_handler != address(0), "INVALID_HANDLER");
-        isHandler[_handler] = _status;
-        emit HandlerUpdated(_handler, _status);
-    }
-
-    /**
-     * @notice Create a code and assign it to an owner. ADMIN ONLY.
-     * @param  _code  The code (bytes32).
-     * @param  _owner The referrer who will earn from it.
-     */
-    function createCode(bytes32 _code, address _owner) external onlyAdmin {
+    /// @notice Create a code and assign it to an owner. ADMIN ONLY.
+    function createCode(bytes32 _code, address _owner) external onlyReferralVaultManager {
         require(_code != bytes32(0), "INVALID_CODE");
         require(_owner != address(0), "INVALID_OWNER");
         require(codeOwner[_code] == address(0), "CODE_EXISTS");
@@ -98,41 +53,44 @@ contract ReferralSystem {
         emit CodeCreated(_code, _owner);
     }
 
-    /*//////////////////////////////////////////////////////////////
-                          OWNER / HANDLER FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-
-    /// @notice Owner hands their code to a new owner (who must hold no code).
-    function transferCodeOwnership(bytes32 _code, address _newOwner) external {
+    /// @notice Admin re-assigns a code to a new owner (who must hold no code).
+    function transferCodeOwnership(bytes32 _code, address _oldOwner, address _newOwner)
+        external
+        onlyReferralVaultManager
+    {
         require(_newOwner != address(0), "INVALID_ADDRESS");
-        require(codeOwner[_code] == msg.sender, "NOT_CODE_OWNER");
+        require(codeOwner[_code] == _oldOwner, "NOT_CODE_OWNER");
         require(ownerToCode[_newOwner] == bytes32(0), "NEW_OWNER_HAS_CODE");
 
         codeOwner[_code] = _newOwner;
-        ownerToCode[msg.sender] = bytes32(0);
+        ownerToCode[_oldOwner] = bytes32(0);
         ownerToCode[_newOwner] = _code;
-        emit CodeTransferred(_code, msg.sender, _newOwner);
+        emit CodeTransferred(_code, _oldOwner, _newOwner);
     }
 
-    /// @notice Deactivate a code (only a handler, e.g. the ReferralVault).
-    function deactivateCode(bytes32 _code) external onlyHandler {
+    /**
+     * @notice Link yourself (the investor) to a code, once. All future deposits
+     *         automatically credit this code — you never resend it.
+     * @param  _code An existing code (not one you own — no self-referral).
+     */
+    function setTraderCode(bytes32 _code) external {
+        require(traderToCode[msg.sender] == bytes32(0), "CODE_ALREADY_SET");
+        require(codeOwner[_code] != address(0), "CODE_DOES_NOT_EXIST");
+        require(codeOwner[_code] != msg.sender, "SELF_REFERRAL");
+
+        traderToCode[msg.sender] = _code;
+        emit TraderCodeSet(msg.sender, _code);
+    }
+
+    /// @dev Clear a code's ownership. The vault layer calls this AFTER checking
+    /// the code has no active balance and no unclaimed rewards. Otherwise rewards are permentanly lost.
+    function _deactivateCode(bytes32 _code) internal {
         address owner = codeOwner[_code];
         require(owner != address(0), "ALREADY_DEACTIVATED");
-
+        require(owner == msg.sender || msg.sender == referralVaultManager, "NOT_OWNER_OR_ADMIN");
+        
         codeOwner[_code] = address(0);
         ownerToCode[owner] = bytes32(0);
         emit CodeDeactivated(_code, owner);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                                 VIEWS
-    //////////////////////////////////////////////////////////////*/
-
-    function getCodeOwner(bytes32 _code) external view returns (address) {
-        return codeOwner[_code];
-    }
-
-    function isValidCode(bytes32 _code) external view returns (bool) {
-        return codeOwner[_code] != address(0);
     }
 }
