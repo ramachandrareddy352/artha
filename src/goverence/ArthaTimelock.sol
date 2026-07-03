@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
+import {TimelockController} from "openzeppelin-contracts/contracts/governance/TimelockController.sol";
 
-/*//////////////////////////////////////////////////////////////////////////
-                             ArthaTimelock
-//////////////////////////////////////////////////////////////////////////*/
 /**
  * @title  ArthaTimelock
  * @notice THE single most important address in Artha governance.
