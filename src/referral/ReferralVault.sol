@@ -70,17 +70,17 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     mapping(uint8 => PoolState) public poolState;
 
     /// @notice poolId => code => account.
-    mapping(uint8 => mapping(bytes32 => CodeAccount)) public codeAccount;
+    mapping(uint8 => mapping(uint64 => CodeAccount)) public codeAccount;
 
     // ---- vault-wide totals (rescue safety) ----
     uint256 public totalEarnedArtha;
     uint256 public totalClaimedArtha;
 
     event RateUpdated(uint8 indexed poolId, uint256 oldRate, uint256 newRate);
-    event Referred(uint8 indexed poolId, bytes32 indexed code, uint256 principal, uint256 newBalance);
-    event Unreferred(uint8 indexed poolId, bytes32 indexed code, uint256 principal, uint256 newBalance);
-    event RewardSettled(uint8 indexed poolId, bytes32 indexed code, uint256 pending);
-    event RewardClaimed(uint8 indexed poolId, bytes32 indexed code, address indexed owner, address to, uint256 amount);
+    event Referred(uint8 indexed poolId, uint64 indexed code, uint256 principal, uint256 newBalance);
+    event Unreferred(uint8 indexed poolId, uint64 indexed code, uint256 principal, uint256 newBalance);
+    event RewardSettled(uint8 indexed poolId, uint64 indexed code, uint256 pending);
+    event RewardClaimed(uint8 indexed poolId, uint64 indexed code, address indexed owner, address to, uint256 amount);
     event Rescued(address indexed token, address to, uint256 amount);
 
     constructor(address _artha, address _admin) ReferralSystem(_admin) {
@@ -112,7 +112,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @dev Bank a code's accrued reward into `earned` and refresh its checkpoint.
-    function _settle(uint8 poolId, bytes32 code) internal {
+    function _settle(uint8 poolId, uint64 code) internal {
         _updateIndex(poolId);
         CodeAccount storage a = codeAccount[poolId][code];
         uint256 accumulated = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC;
@@ -140,8 +140,8 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         _validPool(poolId);
         if (principal == 0) return;
 
-        bytes32 code = traderToCode[investor];
-        if (code == bytes32(0)) return;                       // investor set no code
+        uint64 code = traderToCode[investor];
+        if (code == uint64(0)) return;                        // investor set no code
         address owner = codeOwner[code];
         if (owner == address(0) || owner == investor) return; // deactivated / self-referral
 
@@ -168,8 +168,8 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         _validPool(poolId);
         if (principal == 0) return;
 
-        bytes32 code = traderToCode[investor];
-        if (code == bytes32(0)) return;
+        uint64 code = traderToCode[investor];
+        if (code == uint64(0)) return;
 
         CodeAccount storage a = codeAccount[poolId][code];
         uint256 bal = a.referredBalance;
@@ -186,7 +186,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @notice Permissionless: bring a code's `earned` up to date in a pool.
-    function sync(uint8 poolId, bytes32 code) external {
+    function sync(uint8 poolId, uint64 code) external {
         _validPool(poolId);
         _settle(poolId, code);
     }
@@ -206,7 +206,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @notice The code's CURRENT owner withdraws its ARTHA from one pool.
-    function claim(uint8 poolId, bytes32 code, address to, uint256 amount)
+    function claim(uint8 poolId, uint64 code, address to, uint256 amount)
         public
         nonReentrant
         whenNotPaused
@@ -227,7 +227,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @notice Convenience: claim the full earned balance from every pool at once.
-    function claimAll(bytes32 code, address to) external {
+    function claimAll(uint64 code, address to) external {
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
         for (uint8 i = 0; i < POOL_COUNT; i++) {
             _settle(i, code);
@@ -243,7 +243,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
      *         active referred balance and no unclaimed rewards in ANY pool. This
      *         Executed by code owner or admin.
      */
-    function deactivateCode(bytes32 code) external {
+    function deactivateCode(uint64 code) external {
         for (uint8 i = 0; i < POOL_COUNT; i++) {
             _settle(i, code);
             CodeAccount storage a = codeAccount[i][code];
@@ -274,7 +274,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @notice Live claimable reward for a code in a pool (settled + accruing).
-    function pendingReward(uint8 poolId, bytes32 code) public view returns (uint256) {
+    function pendingReward(uint8 poolId, uint64 code) public view returns (uint256) {
         PoolState storage p = poolState[poolId];
         uint256 accNow = p.accArthaPerToken;
         if (block.timestamp > p.lastUpdate && p.currentRate != 0) {
@@ -287,7 +287,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     }
 
     /// @notice Total live claimable for a code across all three pools.
-    function pendingRewardAllPools(bytes32 code) external view returns (uint256 total) {
+    function pendingRewardAllPools(uint64 code) external view returns (uint256 total) {
         for (uint8 i = 0; i < POOL_COUNT; i++) {
             total += pendingReward(i, code);
         }
