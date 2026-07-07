@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {GovernanceTestBase} from "./helpers/GovernanceTestBase.sol";
 import {MockERC20} from "./helpers/MockERC20.sol";
 import {ReferralVault} from "../src/referral/ReferralVault.sol";
-import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
+import {Pausable} from "openzeppelin-contracts/contracts/utils/Pausable.sol";
 
 /*//////////////////////////////////////////////////////////////////////////
             ReferralSeed.t.sol — everything the seed script does
@@ -19,7 +19,7 @@ import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/utils/Pau
  *   CLAIMS          claim / claimAll, owner gating, funding accounting
  *   TRANSFERS       two-step approve -> execute, revoke, invariant re-check
  *   SAFETY          pause, onlyPool, withdraw clamp, rescue excess-only,
- *                   deactivate wind-down, UUPS upgrade gating
+ *                   deactivate wind-down
  */
 contract ReferralSeedTest is GovernanceTestBase {
     /*//////////////////////////////////////////////////////////////
@@ -57,8 +57,9 @@ contract ReferralSeedTest is GovernanceTestBase {
         assertEq(vault.traderToCode(investor2), CODE_B);
         assertEq(vault.traderToCode(investor3), CODE_C);
 
-        assertTrue(vault.isValidCode(CODE_A));
-        assertFalse(vault.isValidCode(9999));
+        // a live code has an owner; an unknown code resolves to address(0)
+        assertTrue(vault.codeOwner(CODE_A) != address(0));
+        assertEq(vault.codeOwner(9999), address(0));
     }
 
     function test_Seed_InitialRatesOnAllPools() public view {
@@ -70,7 +71,6 @@ contract ReferralSeedTest is GovernanceTestBase {
     function test_Seed_VaultFundedAndDiamondApproved() public view {
         assertEq(artha.balanceOf(address(vault)), VAULT_FUNDING);
         assertTrue(vault.approvedPools(address(diamond)));
-        assertEq(vault.version(), "1.0.0");
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -79,7 +79,6 @@ contract ReferralSeedTest is GovernanceTestBase {
 
     function test_Handoff_AdminIsTimelock() public view {
         assertEq(vault.referralVaultManager(), address(timelock));
-        assertEq(vault.admin(), address(timelock));
     }
 
     function test_Handoff_OldAdminLockedOut() public {
@@ -416,13 +415,13 @@ contract ReferralSeedTest is GovernanceTestBase {
 
         // live balance -> blocked (rewards would be stranded)
         vm.prank(referrerA);
-        vm.expectRevert(bytes("ACTIVE_BALANCE"));
+        vm.expectRevert(bytes("HAS_ACTIVE_BALANCE"));
         vault.deactivateCode(CODE_A);
 
         // balance gone but rewards unclaimed -> still blocked
         diamond.withdraw(2, investor1, 1_000e6);
         vm.prank(referrerA);
-        vm.expectRevert(bytes("UNCLAIMED_REWARDS"));
+        vm.expectRevert(bytes("HAS_UNCLAIMED_REWARDS"));
         vault.deactivateCode(CODE_A);
 
         // claim everything -> now the OWNER can retire the code
@@ -432,7 +431,6 @@ contract ReferralSeedTest is GovernanceTestBase {
         vault.deactivateCode(CODE_A);
 
         assertEq(vault.codeOwner(CODE_A), address(0));
-        assertFalse(vault.isValidCode(CODE_A));
 
         // dead code: new investors cannot link it...
         address fresh = makeAddr("freshInvestor2");
@@ -463,14 +461,14 @@ contract ReferralSeedTest is GovernanceTestBase {
         vm.prank(address(timelock));
         vault.pause();
 
-        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
         diamond.deposit(2, investor1, 1e6);
 
-        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
         diamond.withdraw(2, investor1, 1e6);
 
         vm.prank(referrerA);
-        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        vm.expectRevert(Pausable.EnforcedPause.selector);
         vault.claim(2, CODE_A, referrerA, 1e18);
 
         vm.prank(address(timelock));
@@ -502,8 +500,8 @@ contract ReferralSeedTest is GovernanceTestBase {
 
         uint256 owed = vault.totalEarnedArtha() - vault.totalClaimedArtha();
         assertEq(owed, 1_000e18);
+        // rescuable excess mirrors the contract's inline cap: balance - owed
         uint256 excess = VAULT_FUNDING - owed;
-        assertEq(vault.rescuableArtha(), excess);
 
         address safe = makeAddr("treasurySafe");
 
@@ -529,38 +527,5 @@ contract ReferralSeedTest is GovernanceTestBase {
         vm.prank(address(timelock));
         vault.rescue(address(stray), safe, 777e6);
         assertEq(stray.balanceOf(safe), 777e6);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                      12. UUPS UPGRADE GATING
-    //////////////////////////////////////////////////////////////*/
-
-    function test_Upgrade_OnlyAdmin_TimelockCanSwapImplementation() public {
-        ReferralVaultV2Mock v2 = new ReferralVaultV2Mock();
-
-        // random caller cannot upgrade
-        vm.prank(makeAddr("attacker"));
-        vm.expectRevert(bytes("NOT_REFERRAL_VAULT_MANAGER"));
-        vault.upgradeToAndCall(address(v2), "");
-
-        // neither can the old deployer
-        vm.expectRevert(bytes("NOT_REFERRAL_VAULT_MANAGER"));
-        vault.upgradeToAndCall(address(v2), "");
-
-        // the timelock (i.e. a passed proposal) can
-        vm.prank(address(timelock));
-        vault.upgradeToAndCall(address(v2), "");
-        assertEq(vault.version(), "2.0.0", "implementation swapped");
-
-        // storage untouched by the swap
-        assertEq(vault.codeOwner(CODE_A), referrerA);
-        assertEq(_rate(2), RATE_HIGH);
-    }
-}
-
-/// @dev Minimal V2 used only to prove the upgrade path + storage continuity.
-contract ReferralVaultV2Mock is ReferralVault {
-    function version() external pure override returns (string memory) {
-        return "2.0.0";
     }
 }

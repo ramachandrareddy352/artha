@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {IReferralVault} from "../../src/interfaces/IReferralVault.sol";
+import {IReferralVault} from "../../src/referral/interfaces/IReferralVault.sol";
 
 /*//////////////////////////////////////////////////////////////////////////
                           MockDiamond  (test helper)

@@ -3,9 +3,9 @@ pragma solidity ^0.8.20;
 
 import {GovernanceTestBase} from "./helpers/GovernanceTestBase.sol";
 import {ReferralVault} from "../src/referral/ReferralVault.sol";
-import {IGovernor} from "@openzeppelin/contracts/governance/IGovernor.sol";
-import {Governor} from "@openzeppelin/contracts/governance/Governor.sol";
-import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
+import {IGovernor} from "openzeppelin-contracts/contracts/governance/IGovernor.sol";
+import {ReferralSystem} from "../src/referral/ReferralSystem.sol";
+import {TimelockController} from "openzeppelin-contracts/contracts/governance/TimelockController.sol";
 
 /*//////////////////////////////////////////////////////////////////////////
         ReferralGovernance.t.sol — proposals drive the referral vault
@@ -336,7 +336,7 @@ contract ReferralGovernanceTest is GovernanceTestBase {
         ) = _buildSetRatesProposal(1e18, 1e18, 1e18);
 
         vm.prank(pauper);
-        vm.expectPartialRevert(Governor.GovernorInsufficientProposerVotes.selector);
+        vm.expectPartialRevert(IGovernor.GovernorInsufficientProposerVotes.selector);
         governor.propose(targets, values, calldatas, description);
     }
 
@@ -445,7 +445,7 @@ contract ReferralGovernanceTest is GovernanceTestBase {
         uint256[] memory values = new uint256[](1);
         bytes[] memory calldatas = new bytes[](1);
         targets[0] = address(vault);
-        calldatas[0] = abi.encodeCall(ReferralVault.createCode, (codeD, referrerD));
+        calldatas[0] = abi.encodeCall(ReferralSystem.createCode, (codeD, referrerD));
         string memory description = "ARP-2: Onboard referrer D with code 1004";
 
         uint256 id = _propose(targets, values, calldatas, description);

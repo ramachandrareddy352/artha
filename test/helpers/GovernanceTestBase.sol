@@ -2,8 +2,7 @@
 pragma solidity ^0.8.20;
 
 import {Test} from "forge-std/Test.sol";
-import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
-import {IGovernor} from "@openzeppelin/contracts/governance/IGovernor.sol";
+import {IGovernor} from "openzeppelin-contracts/contracts/governance/IGovernor.sol";
 
 import {ArthaToken} from "../../src/governance/ArthaToken.sol";
 import {ArthaTimelock} from "../../src/governance/ArthaTimelock.sol";
@@ -25,7 +24,7 @@ import {MockDiamond} from "./MockDiamond.sol";
  *           4. Wire roles   (governor -> PROPOSER + CANCELLER,
  *                            guardian -> CANCELLER, address(0) -> EXECUTOR,
  *                            deployer renounces timelock admin)
- *           5. ReferralVault implementation + ERC1967 proxy + initialize
+ *           5. ReferralVault (plain constructor: (artha, admin) — no proxy)
  *           6. Seed         (codes, rates, vault funding, fake voters)
  *           7. HANDOFF      (referral admin -> timelock,
  *                            token DEFAULT_ADMIN_ROLE -> timelock)
@@ -75,7 +74,7 @@ abstract contract GovernanceTestBase is Test {
     ArthaToken internal artha;
     ArthaTimelock internal timelock;
     ArthaGovernor internal governor;
-    ReferralVault internal vault; // the PROXY, typed as the implementation
+    ReferralVault internal vault; // deployed directly (non-upgradeable)
     MockDiamond internal diamond;
 
     /*//////////////////////////////////////////////////////////////
@@ -133,11 +132,11 @@ abstract contract GovernanceTestBase is Test {
         timelock.grantRole(timelock.EXECUTOR_ROLE(), address(0)); // open execution
         timelock.renounceRole(timelock.DEFAULT_ADMIN_ROLE(), address(this));
 
-        /*---------------- 5. referral vault (UUPS) ----------------*/
-        ReferralVault impl = new ReferralVault();
-        bytes memory initData =
-            abi.encodeCall(ReferralVault.initialize, (address(this), address(artha)));
-        vault = ReferralVault(address(new ERC1967Proxy(address(impl), initData)));
+        /*------------- 5. referral vault (plain deploy) -----------*/
+        // Non-upgradeable: constructor is (artha, admin). The deployer (this
+        // test contract) is the temporary admin so it can seed below; it hands
+        // control to the timelock in step 7.
+        vault = new ReferralVault(address(artha), address(this));
 
         diamond = new MockDiamond(address(vault));
         vault.setPool(address(diamond), true);
@@ -191,7 +190,7 @@ abstract contract GovernanceTestBase is Test {
 
         /*---------------------- 7. HANDOFF ------------------------*/
         // Referral vault admin -> TIMELOCK (the whole point of this setup:
-        // every future createCode / setRate / rescue / upgrade is a proposal).
+        // every future createCode / setRate / rescue is a proposal).
         vault.setReferralVaultManager(address(timelock));
 
         // Token role admin -> timelock; deployer steps down. Keep MINTER on
