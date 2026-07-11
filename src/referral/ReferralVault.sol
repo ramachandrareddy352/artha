@@ -8,110 +8,126 @@ import "./ReferralSystem.sol";
 
 /**
  * @title  ReferralVault
- * @notice Top layer — holds the ARTHA and pays code OWNERS based on HOW MUCH
- *         referred capital they bring, HOW LONG it stays, WHICH strategy it sits
- *         in, and WHICH tier the code is on.
+ * @notice Holds ARTHA and pays code OWNERS on: HOW MUCH referred capital, HOW LONG
+ *         it stays, WHICH strategy it sits in, and WHICH tier the code is on.
  *
  *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault (deployed)
  *
  *  ─────────────────────────────────────────────────────────────────────────────
- *  THE REWARD FORMULA (this is the whole product, in one line)
- *
- *      rewardPerYear = (amountNorm * tierRatio * rewardRatio) / 1e36        [ARTHA/yr]
- *      accrued       = rewardPerYear * elapsedSeconds / YEAR                [ARTHA]
- *
- *    where
- *      amountNorm  = referred principal normalised to 18 decimals
- *                    (raw * 10^(18 - tokenDecimals); USDC*1e12, DAI/WETH*1)
- *      rewardRatio = per-STRATEGY rate, set by governance, 0..1e18
- *                    (e.g. a USDC strategy 1e18, a WETH strategy 5e17)
- *      tierRatio   = per-TIER rate, set by governance, 0..1e18
- *                    (e.g. tier1 1e17, tier2 3e17, tier3 1e18)
- *      1e36        = 1e18 * 1e18 (normalises both ratios back out)
- *
- *    Because both ratios are capped at 1e18, their product is capped at 1e36, so
- *    the maximum reward is 100% of the referred principal per year, in ARTHA.
+ *  REWARD FORMULA
+ *      rewardPerYear = (amountNorm * tierRatio * rewardRatio) / 1e36     [ARTHA/yr]
+ *      accrued       = rewardPerYear * elapsed / YEAR                   [ARTHA]
+ *    amountNorm  = raw principal * 10^(18-decimals)   (USDC*1e12, DAI/WETH*1)
+ *    rewardRatio = per-STRATEGY rate, 0..1e18   (USDC 1e18, WETH 5e17, ...)
+ *    tierRatio   = per-TIER rate, 0..1e18       (tier1 1e17, tier2 3e17, tier3 1e18)
+ *    YEAR        = 360 days  (protocol convention)
+ *    Both ratios cap at 1e18 -> max reward = 100% of principal per year.
  *
  *  ─────────────────────────────────────────────────────────────────────────────
- *  KEYED BY STRATEGY ADDRESS, NOT BY TOKEN.
- *  All state is per `strategy` (the vault/strategy contract address). One base
- *  token can back several strategies, each with its own rewardRatio. A referred
- *  investor's balance is tracked per strategy, normalised to 18 dp on entry.
+ *  WHY THIS SCALES TO MANY (uint64) STRATEGIES
  *
- *  THE MECHANISM: MasterChef accumulators, one per (strategy, tier).
- *      acc[strategy][tier] += rewardRatio[strategy] * tierRatio[tier] * dt * ACC
- *                             / (1e36 * YEAR)
- *      earned(code,strategy) = balNorm(code,strategy) * acc[strategy][codeTier]/ACC
- *                              - rewardDebt
- *  Folding BOTH ratios into the accumulator (not applying tier at settle) keeps
- *  the design ZERO-RETROACTIVITY under every governance change:
- *    - changing rewardRatio[S] : we advance all tier lanes of S first,
- *    - changing tierRatio[t]   : we advance lane t of every strategy first,
- *    - promoting a code's tier : we bank it in the old lane, then re-checkpoint
- *                                it in the new lane.
- *  Old accrual always keeps the old rates; only future accrual uses new ones.
+ *  The rate for a (strategy S, tier t) position is rewardRatio[S]*tierRatio[t] — a
+ *  PRODUCT of two independently-governed rates. A naive per-(S,t) accumulator would
+ *  have to be advanced for EVERY strategy whenever a tier ratio changes (fan-out
+ *  over strategies) — impossible at uint64 scale. So we SPLIT it:
  *
- *  EVERYTHING IS VARIABLE. Investors deposit/withdraw any time. There is no lock,
- *  no fixed term. On every balance change the caller banks the code up to `now`
- *  first, so a shrinking position simply stops accruing on the part removed and
- *  the interest earned so far is already sitting in `earned`.
+ *    • accTierSeconds[t] = ∫ tierRatio[t](τ) dτ          (one integral per tier)
+ *        A tier-ratio change advances THIS integral only — O(1), no strategy touch.
+ *        It literally stores "old ratio up to the change timestamp, new after":
+ *        tierLastUpdate[t] is the boundary; the integral banks the old ratio up to
+ *        it; everything after uses the new ratio.
  *
- *  FUNDING: does NOT mint. Mint/transfer ARTHA into this contract up front; claims
- *  pay from balance. Governance can sweep genuine excess via rescue().
+ *    • lane[S][t].acc    = ARTHA per normalised token for that (S,t) pair
+ *        acc += rewardRatio[S] * Δ(accTierSeconds[t]) * ACC / (1e36 * YEAR)
+ *        Valid because rewardRatio[S] is held CONSTANT across the window: a
+ *        reward-ratio change advances every registered tier lane of S FIRST
+ *        (fan-out over TIERS ≤ 8 — trivial), then writes the new ratio.
+ *
+ *  Cost:  tier ratio change O(1);  strategy ratio change O(#tiers ≤ 8);
+ *         code promotion O(#strategies-the-code-uses).  No loop over the global
+ *         strategy set anywhere -> strategies may number up to type(uint64).max.
+ *
+ *  ZERO RETROACTIVITY & PERMISSIONLESS SYNC
+ *    Every ratio change banks the old rate at the change instant, so late settlers
+ *    get the old rate up to the change and the new rate after — never the new rate
+ *    on old time. If a code owner does not settle, ANYONE may call sync()/syncAll()
+ *    to convert that code's PENDING into CLAIMABLE `earned` WITHOUT claiming.
+ *
+ *  DOUBLE-SYNC SAFETY
+ *    _settle() sets rewardDebt = accumulated AFTER banking; an immediate second
+ *    settle computes pending = accumulated - rewardDebt = 0. No path pays twice.
+ *
+ *  PER-STRATEGY BOOKS: live referred principal (raw + normalised) and cumulative
+ *  ARTHA earned/claimed, per strategy — see StrategyMeta and strategyBooks().
+ *
+ *  FUNDING: does NOT mint. Fund with ARTHA up front; claims pay from balance.
  */
 contract ReferralVault is ReferralSystem, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ---- fixed-point constants ----
     uint256 public constant ACC = 1e18;        // accumulator precision
-    uint256 public constant YEAR = 365 days;   // seconds per year
-    uint256 public constant RATIO_ONE = 1e18;  // "1.0" for a ratio; also the cap
+    uint256 public constant YEAR = 360 days;   // 360-day year (protocol convention)
+    uint256 public constant RATIO_ONE = 1e18;  // "1.0" and the cap for any ratio
     uint256 public constant RATIO_SQ = 1e36;   // RATIO_ONE * RATIO_ONE
 
-    // ---- loop-bound safety (keep claimAll / rate changes O(bounded)) ----
-    uint256 public constant MAX_STRATEGIES = 64;
-    uint256 public constant MAX_TIERS = 8;
+    uint8   public constant MAX_TIERS = 8;     // tiers 1..8
 
     IERC20 public immutable artha;
 
-    /// @notice Global config + running totals for one strategy (all tiers).
+    /// @notice Config + running books for one strategy (across all tiers).
     struct StrategyMeta {
-        bool registered;
+        bool    registered;
+        uint8   decimals;          // base-token decimals (for reference)
         uint256 rewardRatio;       // per-strategy rate, 0..1e18
-        uint256 scale;             // 10^(18 - tokenDecimals); normalises raw -> 18dp
-        uint256 totalReferredNorm; // total active referred principal (18dp) in this strategy
+        uint256 scale;             // 10^(18 - decimals); raw -> 18dp
+        uint256 totalPrincipalRaw; // live referred principal, raw base-token units
+        uint256 totalReferredNorm; // live referred principal, normalised 18dp
+        uint256 totalArthaEarned;  // cumulative ARTHA credited for this strategy
+        uint256 totalArthaClaimed; // cumulative ARTHA claimed from this strategy
     }
 
-    /// @notice One MasterChef lane per (strategy, tier).
+    /// @notice ARTHA-per-normalised-token accumulator for one (strategy, tier).
     struct Lane {
-        uint256 accArthaPerToken; // accumulator, scaled by ACC
-        uint256 lastUpdate;       // last time this lane advanced (0 = uninitialised)
+        bool    init;             // false until first touch (no back-pay before then)
+        uint256 acc;              // scaled by ACC
+        uint256 tierSecondsMark;  // accTierSeconds[tier] snapshot at last advance
     }
 
     /// @notice Per (strategy, code) account.
     struct CodeAccount {
-        uint256 balanceNorm; // active referred principal, normalised to 18dp
-        uint256 rewardDebt;  // balanceNorm * acc[strategy][codeTier]/ACC at last settle
+        uint256 balanceNorm; // live referred principal, 18dp
+        uint256 rewardDebt;  // balanceNorm * lane.acc / ACC at last settle
         uint256 earned;      // settled, claimable ARTHA
         uint256 claimed;     // lifetime claimed ARTHA (tracking)
     }
 
-    mapping(address => StrategyMeta) public strategyMeta;                 // strategy => meta
-    mapping(address => mapping(uint8 => Lane)) public lane;               // strategy => tier => lane
-    mapping(address => mapping(uint64 => CodeAccount)) public codeAccount; // strategy => code => account
-    mapping(uint8 => uint256) public tierRatio;                          // tier => ratio 0..1e18
+    // ---- strategy config / books ----
+    mapping(address => StrategyMeta) public strategyMeta;
+    uint64 public strategyCount; // registered strategies (uint64 space)
 
-    address[] public registeredStrategies;
-    uint8[] public registeredTiers;
+    // ---- tiers: global ratio-seconds integrals ----
+    mapping(uint8 => uint256) public tierRatio;      // tier => ratio 0..1e18
+    mapping(uint8 => uint256) public accTierSeconds; // tier => ∫ tierRatio dτ
+    mapping(uint8 => uint256) public tierLastUpdate; // tier => last advance ts (change boundary)
+    uint8[] public registeredTiers;                  // ≤ MAX_TIERS
     mapping(uint8 => bool) private _tierKnown;
+
+    // ---- per-(strategy,tier) lanes and per-(strategy,code) accounts ----
+    mapping(address => mapping(uint8 => Lane)) public lane;
+    mapping(address => mapping(uint64 => CodeAccount)) public codeAccount;
+
+    // ---- per-code footprint (bounds claimAll / deactivate / pendingAll / syncAll) ----
+    mapping(uint64 => address[]) public codeStrategies;
+    mapping(uint64 => mapping(address => bool)) public codeHasStrategy;
 
     // ---- vault-wide totals (rescue safety) ----
     uint256 public totalEarnedArtha;
     uint256 public totalClaimedArtha;
 
-    event StrategyRegistered(address indexed strategy, uint8 tokenDecimals, uint256 scale, uint256 rewardRatio);
-    event RewardRatioUpdated(address indexed strategy, uint256 oldRatio, uint256 newRatio);
-    event TierRatioUpdated(uint8 indexed tier, uint256 oldRatio, uint256 newRatio);
+    event StrategyRegistered(address indexed strategy, uint8 decimals, uint256 scale, uint256 rewardRatio);
+    event RewardRatioUpdated(address indexed strategy, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
+    event TierRatioUpdated(uint8 indexed tier, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
     event CodeTierChanged(uint64 indexed code, uint8 oldTier, uint8 newTier);
     event Referred(address indexed strategy, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
     event Unreferred(address indexed strategy, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
@@ -123,146 +139,155 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         require(_artha != address(0), "INVALID_ARTHA");
         artha = IERC20(_artha);
 
-        // Sensible defaults for the first three tiers; governance can change any of
-        // them later via setTierRatio(). Cap is 1e18 ("1.0").
+        // default tiers (governance may change any ratio and add tiers up to 8)
         _initTier(1, 1e17); // 0.1
         _initTier(2, 3e17); // 0.3
         _initTier(3, 1e18); // 1.0
     }
 
-    // ───────────────────────────── configuration ────────────────────────────────
+    // ─────────────────────── tier ratio-seconds integral ─────────────────────────
 
-    /// @notice Register a strategy/vault so referred balances in it earn reward.
-    /// @param  strategy      The vault/strategy contract address (the reward key).
-    /// @param  tokenDecimals Decimals of that strategy's base token (USDC 6, WETH 18).
-    /// @param  rewardRatio_  Per-strategy rate, 0..1e18 (e.g. USDC 1e18, WETH 5e17).
-    function registerStrategy(address strategy, uint8 tokenDecimals, uint256 rewardRatio_)
-        external
-        onlyReferralVaultManager
-    {
-        require(strategy != address(0), "INVALID_STRATEGY");
-        require(!strategyMeta[strategy].registered, "ALREADY_REGISTERED");
-        require(tokenDecimals <= 18, "DECIMALS_GT_18");
-        require(rewardRatio_ <= RATIO_ONE, "RATIO_GT_ONE");
-        require(registeredStrategies.length < MAX_STRATEGIES, "TOO_MANY_STRATEGIES");
-
-        uint256 scale = 10 ** (18 - tokenDecimals);
-        strategyMeta[strategy] = StrategyMeta({
-            registered: true,
-            rewardRatio: rewardRatio_,
-            scale: scale,
-            totalReferredNorm: 0
-        });
-        registeredStrategies.push(strategy);
-        emit StrategyRegistered(strategy, tokenDecimals, scale, rewardRatio_);
-    }
-
-    /// @notice Change a strategy's reward ratio. Advances EVERY tier lane of this
-    ///         strategy first, so the change is not retroactive.
-    function setRewardRatio(address strategy, uint256 newRatio) external onlyReferralVaultManager {
-        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
-        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
-        uint256 n = registeredTiers.length;
-        for (uint256 i = 0; i < n; i++) {
-            _updateLane(strategy, registeredTiers[i]);
-        }
-        uint256 old = strategyMeta[strategy].rewardRatio;
-        strategyMeta[strategy].rewardRatio = newRatio;
-        emit RewardRatioUpdated(strategy, old, newRatio);
-    }
-
-    /// @notice Set a tier's ratio. Advances lane `tier` of EVERY strategy first, so
-    ///         the change is not retroactive. Adds the tier to the known set.
-    function setTierRatio(uint8 tier, uint256 newRatio) external onlyReferralVaultManager {
-        require(tier != 0, "INVALID_TIER");
-        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
-        uint256 n = registeredStrategies.length;
-        for (uint256 i = 0; i < n; i++) {
-            _updateLane(registeredStrategies[i], tier);
-        }
-        uint256 old = tierRatio[tier];
-        tierRatio[tier] = newRatio;
-        if (!_tierKnown[tier]) {
-            require(registeredTiers.length < MAX_TIERS, "TOO_MANY_TIERS");
-            _tierKnown[tier] = true;
-            registeredTiers.push(tier);
-        }
-        emit TierRatioUpdated(tier, old, newRatio);
-    }
-
-    /// @notice Promote/demote a code's tier. Banks the code at its OLD tier lane in
-    ///         every strategy, switches the tier, then re-checkpoints in the NEW
-    ///         lane — so accrual before the change keeps the old tier's rate.
-    function setCodeTier(uint64 code, uint8 newTier) external onlyReferralVaultManager {
-        require(codeOwner[code] != address(0), "CODE_DOES_NOT_EXIST");
-        require(newTier != 0, "INVALID_TIER");
-
-        uint256 n = registeredStrategies.length;
-        // 1) bank everything at the current (old) tier.
-        for (uint256 i = 0; i < n; i++) {
-            _settle(registeredStrategies[i], code);
-        }
-        // 2) switch the tier (registry write).
-        uint8 oldTier = codeTier[code];
-        _setCodeTier(code, newTier);
-        // 3) re-checkpoint against the new tier's lane so future accrual uses it.
-        for (uint256 i = 0; i < n; i++) {
-            address s = registeredStrategies[i];
-            _updateLane(s, newTier);
-            CodeAccount storage a = codeAccount[s][code];
-            a.rewardDebt = (a.balanceNorm * lane[s][newTier].accArthaPerToken) / ACC;
-        }
-        emit CodeTierChanged(code, oldTier, newTier);
-    }
-
-    // ───────────────────────────── accrual core ─────────────────────────────────
-
-    /// @dev Advance one (strategy, tier) lane at the CURRENT rates over [last, now].
-    ///      Lazily initialises lastUpdate so an untouched lane never back-pays.
-    function _updateLane(address strategy, uint8 tier) internal {
-        Lane storage L = lane[strategy][tier];
+    /// @dev Advance accTierSeconds[t] to now using CURRENT tierRatio[t]. Storing the
+    ///      integral IS storing "old ratio up to tierLastUpdate, new after".
+    function _syncTier(uint8 t) internal {
         uint256 nowTs = block.timestamp;
-        if (L.lastUpdate == 0) {
-            L.lastUpdate = nowTs; // first touch: start the clock, accrue nothing
+        uint256 last = tierLastUpdate[t];
+        if (last == 0) { tierLastUpdate[t] = nowTs; return; }
+        if (nowTs > last) {
+            accTierSeconds[t] += tierRatio[t] * (nowTs - last);
+            tierLastUpdate[t] = nowTs;
+        }
+    }
+
+    // ─────────────────────────── lane accrual core ──────────────────────────────
+
+    /// @dev Advance one (strategy, tier) lane. rewardRatio[S] is constant across the
+    ///      window (setRewardRatio advances every tier lane of S before changing it).
+    function _updateLane(address strategy, uint8 tier) internal {
+        _syncTier(tier);
+        Lane storage L = lane[strategy][tier];
+        if (!L.init) {
+            L.init = true;
+            L.tierSecondsMark = accTierSeconds[tier];
             return;
         }
-        if (nowTs <= L.lastUpdate) return;
-
-        uint256 rr = strategyMeta[strategy].rewardRatio;
-        uint256 tr = tierRatio[tier];
-        if (rr != 0 && tr != 0) {
-            uint256 dt = nowTs - L.lastUpdate;
-            // acc += rewardRatio * tierRatio * dt * ACC / (1e36 * YEAR)
-            L.accArthaPerToken += (rr * tr * dt * ACC) / (RATIO_SQ * YEAR);
+        uint256 dts = accTierSeconds[tier] - L.tierSecondsMark;
+        if (dts != 0) {
+            uint256 rr = strategyMeta[strategy].rewardRatio;
+            if (rr != 0) {
+                L.acc += (rr * dts * ACC) / (RATIO_SQ * YEAR);
+            }
+            L.tierSecondsMark = accTierSeconds[tier];
         }
-        L.lastUpdate = nowTs;
     }
 
-    /// @dev Bank a code's accrued reward in one strategy into `earned`, using the
-    ///      code's CURRENT tier lane, then refresh its checkpoint.
+    /// @dev Bank a code's accrued reward in one strategy into `earned`, then refresh
+    ///      its checkpoint. Idempotent within a block (double-settle banks nothing).
     function _settle(address strategy, uint64 code) internal {
         uint8 tier = codeTier[code];
         _updateLane(strategy, tier);
         CodeAccount storage a = codeAccount[strategy][code];
-        uint256 accumulated = (a.balanceNorm * lane[strategy][tier].accArthaPerToken) / ACC;
-        uint256 pending = accumulated - a.rewardDebt; // monotonic acc => never underflows
+        uint256 accumulated = (a.balanceNorm * lane[strategy][tier].acc) / ACC;
+        uint256 pending = accumulated - a.rewardDebt; // acc monotonic -> never underflows
         if (pending != 0) {
             a.earned += pending;
+            strategyMeta[strategy].totalArthaEarned += pending;
             totalEarnedArtha += pending;
             emit RewardSettled(strategy, code, pending);
         }
         a.rewardDebt = accumulated;
     }
 
+    // ───────────────────────────── configuration ────────────────────────────────
+
+    /// @notice Register a strategy/vault so referred balances in it earn reward.
+    function registerStrategy(address strategy, uint8 decimals, uint256 rewardRatio_)
+        external
+        onlyReferralVaultManager
+    {
+        require(strategy != address(0), "INVALID_STRATEGY");
+        require(!strategyMeta[strategy].registered, "ALREADY_REGISTERED");
+        require(decimals <= 18, "DECIMALS_GT_18");
+        require(rewardRatio_ <= RATIO_ONE, "RATIO_GT_ONE");
+        require(strategyCount < type(uint64).max, "TOO_MANY_STRATEGIES");
+
+        uint256 scale = 10 ** (18 - decimals);
+        strategyMeta[strategy] = StrategyMeta({
+            registered: true,
+            decimals: decimals,
+            rewardRatio: rewardRatio_,
+            scale: scale,
+            totalPrincipalRaw: 0,
+            totalReferredNorm: 0,
+            totalArthaEarned: 0,
+            totalArthaClaimed: 0
+        });
+        unchecked { strategyCount += 1; }
+        emit StrategyRegistered(strategy, decimals, scale, rewardRatio_);
+    }
+
+    /// @notice Change a strategy's reward ratio. Advances EVERY tier lane of this
+    ///         strategy first (≤8) so the change is not retroactive.
+    function setRewardRatio(address strategy, uint256 newRatio) external onlyReferralVaultManager {
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
+        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
+        uint256 n = registeredTiers.length;
+        for (uint256 i = 0; i < n; i++) {
+            _updateLane(strategy, registeredTiers[i]); // bank old rate into each lane
+        }
+        uint256 old = strategyMeta[strategy].rewardRatio;
+        strategyMeta[strategy].rewardRatio = newRatio;
+        emit RewardRatioUpdated(strategy, old, newRatio, block.timestamp);
+    }
+
+    /// @notice Set a tier's ratio. O(1): advances ONLY this tier's ratio-seconds
+    ///         integral (banking the old ratio up to now), then writes the new ratio.
+    ///         Strategy lanes pick up the correct old/new split on next advance.
+    function setTierRatio(uint8 tier, uint256 newRatio) external onlyReferralVaultManager {
+        require(tier != 0, "INVALID_TIER");
+        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
+        _syncTier(tier); // bank old ratio up to the change boundary
+        uint256 old = tierRatio[tier];
+        tierRatio[tier] = newRatio;
+        if (!_tierKnown[tier]) {
+            require(registeredTiers.length < MAX_TIERS, "TOO_MANY_TIERS");
+            _tierKnown[tier] = true;
+            if (tierLastUpdate[tier] == 0) tierLastUpdate[tier] = block.timestamp;
+            registeredTiers.push(tier);
+        }
+        emit TierRatioUpdated(tier, old, newRatio, block.timestamp);
+    }
+
+    /// @notice Promote/demote a code's tier. Banks the code at its OLD tier lane in
+    ///         each strategy it uses, switches the tier, then re-checkpoints in the
+    ///         NEW tier lane — accrual before the change keeps the old tier's rate.
+    function setCodeTier(uint64 code, uint8 newTier) external onlyReferralVaultManager {
+        require(codeOwner[code] != address(0), "CODE_DOES_NOT_EXIST");
+        require(_tierKnown[newTier], "TIER_NOT_SET");
+
+        address[] storage list = codeStrategies[code];
+        uint256 n = list.length;
+
+        // 1) bank everything at the current (old) tier.
+        for (uint256 i = 0; i < n; i++) {
+            _settle(list[i], code);
+        }
+        // 2) switch the tier (registry write in ReferralSystem).
+        uint8 oldTier = codeTier[code];
+        _setCodeTier(code, newTier);
+        // 3) re-checkpoint against the new tier lane so future accrual uses it.
+        for (uint256 i = 0; i < n; i++) {
+            address s = list[i];
+            _updateLane(s, newTier);
+            CodeAccount storage a = codeAccount[s][code];
+            a.rewardDebt = (a.balanceNorm * lane[s][newTier].acc) / ACC;
+        }
+        emit CodeTierChanged(code, oldTier, newTier);
+    }
+
     // ─────────────────────────────── hooks ──────────────────────────────────────
 
-    /**
-     * @notice A referred deposit into `strategy`. The code is read from the
-     *         investor's stored traderToCode — the investor never resends it.
-     * @param  strategy     The vault/strategy contract that custodies the principal.
-     * @param  investor     The depositor.
-     * @param  rawPrincipal Referred amount in the strategy's base-token decimals.
-     */
+    /// @notice A referred deposit into `strategy`. Code read from traderToCode.
     function notifyDeposit(address strategy, address investor, uint256 rawPrincipal)
         external
         onlyCaller
@@ -272,27 +297,29 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         if (rawPrincipal == 0) return;
 
         uint64 code = traderToCode[investor];
-        if (code == uint64(0)) return;                         // investor set no code
+        if (code == uint64(0)) return;
         address owner = codeOwner[code];
-        if (owner == address(0) || owner == investor) return;  // deactivated / self-referral
+        if (owner == address(0) || owner == investor) return; // deactivated / self-referral
 
-        _settle(strategy, code);                               // bank at OLD balance
+        _settle(strategy, code); // bank at OLD balance
         uint256 addNorm = rawPrincipal * strategyMeta[strategy].scale;
         CodeAccount storage a = codeAccount[strategy][code];
         a.balanceNorm += addNorm;
-        strategyMeta[strategy].totalReferredNorm += addNorm;
-        // re-checkpoint at the new balance in the code's current tier lane
-        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].accArthaPerToken) / ACC;
 
+        StrategyMeta storage m = strategyMeta[strategy];
+        m.totalPrincipalRaw += rawPrincipal;
+        m.totalReferredNorm += addNorm;
+
+        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].acc) / ACC; // re-checkpoint
+
+        if (!codeHasStrategy[code][strategy]) {
+            codeHasStrategy[code][strategy] = true;
+            codeStrategies[code].push(strategy);
+        }
         emit Referred(strategy, code, rawPrincipal, a.balanceNorm);
     }
 
-    /**
-     * @notice A referred position in `strategy` shrinks or fully exits.
-     * @param  strategy     The vault/strategy contract.
-     * @param  investor     The withdrawing depositor.
-     * @param  rawPrincipal Amount leaving, in base-token decimals.
-     */
+    /// @notice A referred position in `strategy` shrinks or fully exits.
     function notifyWithdraw(address strategy, address investor, uint256 rawPrincipal)
         external
         onlyCaller
@@ -307,21 +334,36 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         CodeAccount storage a = codeAccount[strategy][code];
         if (a.balanceNorm == 0) return;
 
-        _settle(strategy, code);                               // bank up to now first
+        _settle(strategy, code); // bank up to now first
 
-        uint256 decNorm = rawPrincipal * strategyMeta[strategy].scale;
-        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm;  // clamp (defensive)
+        uint256 scale = strategyMeta[strategy].scale;
+        uint256 decNorm = rawPrincipal * scale;
+        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm; // clamp (defensive)
+        uint256 decRaw = decNorm / scale;
         a.balanceNorm -= decNorm;
-        strategyMeta[strategy].totalReferredNorm -= decNorm;
-        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].accArthaPerToken) / ACC;
 
-        emit Unreferred(strategy, code, rawPrincipal, a.balanceNorm);
+        StrategyMeta storage m = strategyMeta[strategy];
+        m.totalReferredNorm -= decNorm;
+        m.totalPrincipalRaw = m.totalPrincipalRaw >= decRaw ? m.totalPrincipalRaw - decRaw : 0;
+
+        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].acc) / ACC;
+        emit Unreferred(strategy, code, decRaw, a.balanceNorm);
     }
 
-    /// @notice Permissionless: bring a code's `earned` in one strategy up to date.
-    function sync(address strategy, uint64 code) external {
+    // ───────────────────────── permissionless sync ──────────────────────────────
+
+    /// @notice Anyone may bank a code's PENDING -> CLAIMABLE in one strategy without
+    ///         claiming. Safe to call repeatedly (double-sync banks nothing extra).
+    function sync(address strategy, uint64 code) public {
         require(strategyMeta[strategy].registered, "NOT_REGISTERED");
         _settle(strategy, code);
+    }
+
+    /// @notice Anyone may bank a code across every strategy it uses.
+    function syncAll(uint64 code) external {
+        address[] storage list = codeStrategies[code];
+        uint256 n = list.length;
+        for (uint256 i = 0; i < n; i++) _settle(list[i], code);
     }
 
     // ─────────────────────────────── claiming ───────────────────────────────────
@@ -340,34 +382,34 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         CodeAccount storage a = codeAccount[strategy][code];
         require(a.earned >= amount, "INSUFFICIENT_REWARDS");
 
-        a.earned -= amount;               // checks-effects-interactions
+        a.earned -= amount;
         a.claimed += amount;
+        strategyMeta[strategy].totalArthaClaimed += amount;
         totalClaimedArtha += amount;
         artha.safeTransfer(to, amount);
         emit RewardClaimed(strategy, code, msg.sender, to, amount);
     }
 
-    /// @notice Claim the full earned balance across every registered strategy.
+    /// @notice Claim the full earned balance across every strategy the code uses.
     function claimAll(uint64 code, address to) external {
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
-        uint256 n = registeredStrategies.length;
+        address[] storage list = codeStrategies[code];
+        uint256 n = list.length;
         for (uint256 i = 0; i < n; i++) {
-            address s = registeredStrategies[i];
+            address s = list[i];
             _settle(s, code);
             uint256 amt = codeAccount[s][code].earned;
-            if (amt != 0) claim(s, code, to, amt); // reuses owner check + nonReentrant
+            if (amt != 0) claim(s, code, to, amt);
         }
     }
 
-    /**
-     * @notice Deactivate a code. Requires it to be fully wound down first in EVERY
-     *         strategy: no active balance and no unclaimed rewards anywhere.
-     *         Callable by the code owner or the admin.
-     */
+    /// @notice Deactivate a code once fully wound down (zero balance and zero
+    ///         unclaimed) in every strategy it used.
     function deactivateCode(uint64 code) external {
-        uint256 n = registeredStrategies.length;
+        address[] storage list = codeStrategies[code];
+        uint256 n = list.length;
         for (uint256 i = 0; i < n; i++) {
-            address s = registeredStrategies[i];
+            address s = list[i];
             _settle(s, code);
             CodeAccount storage a = codeAccount[s][code];
             require(a.balanceNorm == 0, "HAS_ACTIVE_BALANCE");
@@ -378,13 +420,6 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
 
     // ─────────────────────────────── rescue ─────────────────────────────────────
 
-    /**
-     * @notice Recover funds the vault should not keep: excess ARTHA (above what is
-     *         already settled-and-unclaimed) or any stray token.
-     * @dev    For ARTHA the cap is `balance - (totalEarned - totalClaimed)`. Reward
-     *         still accruing on active codes is NOT reserved here — keep the vault
-     *         funded above ongoing accrual and only sweep clear excess.
-     */
     function rescue(address token, address to, uint256 amount) external onlyReferralVaultManager {
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
         if (token == address(artha)) {
@@ -402,29 +437,59 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     /// @notice Live claimable reward for a code in one strategy (settled + accruing).
     function pendingReward(address strategy, uint64 code) public view returns (uint256) {
         uint8 tier = codeTier[code];
-        Lane storage L = lane[strategy][tier];
-        uint256 accNow = L.accArthaPerToken;
-        uint256 rr = strategyMeta[strategy].rewardRatio;
-        uint256 tr = tierRatio[tier];
-        if (L.lastUpdate != 0 && block.timestamp > L.lastUpdate && rr != 0 && tr != 0) {
-            uint256 dt = block.timestamp - L.lastUpdate;
-            accNow += (rr * tr * dt * ACC) / (RATIO_SQ * YEAR);
+
+        uint256 ats = accTierSeconds[tier];
+        uint256 last = tierLastUpdate[tier];
+        if (last != 0 && block.timestamp > last) {
+            ats += tierRatio[tier] * (block.timestamp - last);
         }
+
+        Lane storage L = lane[strategy][tier];
+        uint256 accNow = L.acc;
+        if (L.init) {
+            uint256 dts = ats - L.tierSecondsMark;
+            uint256 rr = strategyMeta[strategy].rewardRatio;
+            if (dts != 0 && rr != 0) accNow += (rr * dts * ACC) / (RATIO_SQ * YEAR);
+        }
+
         CodeAccount storage a = codeAccount[strategy][code];
         uint256 accumulated = (a.balanceNorm * accNow) / ACC;
         return a.earned + (accumulated - a.rewardDebt);
     }
 
-    /// @notice Total live claimable for a code across every registered strategy.
+    /// @notice Total live claimable for a code across every strategy it uses.
     function pendingRewardAll(uint64 code) external view returns (uint256 total) {
-        uint256 n = registeredStrategies.length;
-        for (uint256 i = 0; i < n; i++) {
-            total += pendingReward(registeredStrategies[i], code);
-        }
+        address[] storage list = codeStrategies[code];
+        uint256 n = list.length;
+        for (uint256 i = 0; i < n; i++) total += pendingReward(list[i], code);
     }
 
-    function strategiesCount() external view returns (uint256) {
-        return registeredStrategies.length;
+    /// @notice Per-strategy books: live principal (raw + normalised) and ARTHA flows.
+    function strategyBooks(address strategy)
+        external
+        view
+        returns (
+            uint256 rewardRatio_,
+            uint256 principalRaw,
+            uint256 principalNorm,
+            uint256 arthaEarned,
+            uint256 arthaClaimed,
+            uint256 arthaOutstanding
+        )
+    {
+        StrategyMeta storage m = strategyMeta[strategy];
+        return (
+            m.rewardRatio,
+            m.totalPrincipalRaw,
+            m.totalReferredNorm,
+            m.totalArthaEarned,
+            m.totalArthaClaimed,
+            m.totalArthaEarned - m.totalArthaClaimed
+        );
+    }
+
+    function codeStrategiesCount(uint64 code) external view returns (uint256) {
+        return codeStrategies[code].length;
     }
 
     function tiersCount() external view returns (uint256) {
@@ -435,6 +500,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
 
     function _initTier(uint8 tier, uint256 ratio) private {
         tierRatio[tier] = ratio;
+        tierLastUpdate[tier] = block.timestamp; // start the integral clock now
         _tierKnown[tier] = true;
         registeredTiers.push(tier);
     }

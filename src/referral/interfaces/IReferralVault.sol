@@ -4,56 +4,131 @@ pragma solidity ^0.8.20;
 import "./IReferralSystem.sol";
 
 /**
- * @title IReferralVault
- * @notice Full external surface of the deployed ReferralVault (extends the
- *         registry + manager surfaces). This is the interface the Diamond's
- *         facets import to drive deposits/withdrawals, and that investors /
- *         code owners use to set codes and claim.
- * 
- *  poolId convention: 0 = LOW, 1 = MEDIUM, 2 = HIGH.
+ * @title  IReferralVault
+ * @notice Full external surface of the deployed ReferralVault (extends registry +
+ *         manager surfaces). This is the interface the Artha vault layer imports to
+ *         drive referred deposits/withdrawals, and that code owners use to claim.
  *
- *  Diamond call sites (msg.sender must be an approved pool = the Diamond):
- *     - referred deposit  -> notifyDeposit(poolId, investor, principal)
- *     - referred exit      -> notifyWithdraw(poolId, investor, principal)
+ *  KEYED BY STRATEGY ADDRESS (not pool, not token). One base token can back several
+ *  strategies, each with its own rewardRatio. Reward for a (strategy, tier) position
+ *  is:  (amountNorm * tierRatio[tier] * rewardRatio[strategy]) / 1e36 per YEAR,
+ *  with YEAR = 360 days and both ratios capped at 1e18.
+ *
+ *  Caller sites (msg.sender must be an approved caller = the vault / Diamond):
+ *     - referred deposit -> notifyDeposit(strategy, investor, rawPrincipal)
+ *     - referred exit     -> notifyWithdraw(strategy, investor, rawPrincipal)
  *  (The code is resolved from the investor's one-time traderToCode.)
+ *
+ *  Anyone may sync()/syncAll() to bank a code's pending into claimable `earned`
+ *  without claiming. Ratio changes are non-retroactive and never overpay, so
+ *  correctness does not depend on who (if anyone) calls sync.
+ *
+ *  Events are emitted by the implementation and omitted here (see manager note).
  */
 interface IReferralVault is IReferralSystem {
-    // constants (exposed as getters)
-    function POOL_LOW() external view returns (uint8);
-    function POOL_MEDIUM() external view returns (uint8);
-    function POOL_HIGH() external view returns (uint8);
-    function POOL_COUNT() external view returns (uint8);
+    // ─────────────────────────── constants (getters) ────────────────────────────
+    function ACC() external view returns (uint256);
+    function YEAR() external view returns (uint256);
+    function RATIO_ONE() external view returns (uint256);
+    function RATIO_SQ() external view returns (uint256);
+    function MAX_TIERS() external view returns (uint8);
     function artha() external view returns (address);
 
-    // per-pool + per-code state (struct getters return tuples)
-    function poolState(uint8 poolId)
+    // ─────────────────────────── strategy config / books ────────────────────────
+    /// @return registered        whether the strategy is active
+    /// @return decimals          base-token decimals
+    /// @return rewardRatio       per-strategy rate (0..1e18)
+    /// @return scale             10^(18 - decimals)
+    /// @return totalPrincipalRaw live referred principal, raw base-token units
+    /// @return totalReferredNorm live referred principal, normalised 18dp
+    /// @return totalArthaEarned  cumulative ARTHA credited for this strategy
+    /// @return totalArthaClaimed cumulative ARTHA claimed from this strategy
+    function strategyMeta(address strategy)
         external
         view
-        returns (uint256 currentRate, uint256 accArthaPerToken, uint256 lastUpdate, uint256 totalReferred);
+        returns (
+            bool registered,
+            uint8 decimals,
+            uint256 rewardRatio,
+            uint256 scale,
+            uint256 totalPrincipalRaw,
+            uint256 totalReferredNorm,
+            uint256 totalArthaEarned,
+            uint256 totalArthaClaimed
+        );
 
-    function codeAccount(uint8 poolId, bytes32 code)
+    function strategyCount() external view returns (uint64);
+
+    /// @notice Convenience read of a strategy's books.
+    function strategyBooks(address strategy)
         external
         view
-        returns (uint256 referredBalance, uint256 rewardDebt, uint256 earned, uint256 claimed);
+        returns (
+            uint256 rewardRatio_,
+            uint256 principalRaw,
+            uint256 principalNorm,
+            uint256 arthaEarned,
+            uint256 arthaClaimed,
+            uint256 arthaOutstanding
+        );
 
+    // ─────────────────────────── tier ratio-seconds state ───────────────────────
+    function tierRatio(uint8 tier) external view returns (uint256);
+    function accTierSeconds(uint8 tier) external view returns (uint256);
+    function tierLastUpdate(uint8 tier) external view returns (uint256);
+    function registeredTiers(uint256 index) external view returns (uint8);
+    function tiersCount() external view returns (uint256);
+
+    // ─────────────────────────── lanes & accounts ───────────────────────────────
+    /// @return init            whether this (strategy,tier) lane has been touched
+    /// @return acc             ARTHA-per-normalised-token accumulator (scaled by ACC)
+    /// @return tierSecondsMark accTierSeconds[tier] snapshot at last advance
+    function lane(address strategy, uint8 tier)
+        external
+        view
+        returns (bool init, uint256 acc, uint256 tierSecondsMark);
+
+    /// @return balanceNorm live referred principal for this (strategy,code), 18dp
+    /// @return rewardDebt  checkpoint = balanceNorm * lane.acc / ACC at last settle
+    /// @return earned      settled, claimable ARTHA
+    /// @return claimed     lifetime claimed ARTHA
+    function codeAccount(address strategy, uint64 code)
+        external
+        view
+        returns (uint256 balanceNorm, uint256 rewardDebt, uint256 earned, uint256 claimed);
+
+    // ─────────────────────────── per-code footprint ─────────────────────────────
+    function codeStrategies(uint64 code, uint256 index) external view returns (address);
+    function codeHasStrategy(uint64 code, address strategy) external view returns (bool);
+    function codeStrategiesCount(uint64 code) external view returns (uint256);
+
+    // ─────────────────────────── vault-wide totals ──────────────────────────────
     function totalEarnedArtha() external view returns (uint256);
     function totalClaimedArtha() external view returns (uint256);
 
-    // hooks (from the Diamond)
-    function notifyDeposit(uint8 poolId, address investor, uint256 principal) external;
-    function notifyWithdraw(uint8 poolId, address investor, uint256 principal) external;
-    function sync(uint8 poolId, bytes32 code) external;
+    // ─────────────────────────── configuration (governance) ─────────────────────
+    function registerStrategy(address strategy, uint8 decimals, uint256 rewardRatio_) external;
+    function setRewardRatio(address strategy, uint256 newRatio) external;
+    function setTierRatio(uint8 tier, uint256 newRatio) external;
+    function setCodeTier(uint64 code, uint8 newTier) external;
 
-    // admin
-    function setRate(uint8 poolId, uint256 newRate) external;
-    function deactivateCode(bytes32 code) external;
+    // ─────────────────────────── hooks (approved caller) ────────────────────────
+    function notifyDeposit(address strategy, address investor, uint256 rawPrincipal) external;
+    function notifyWithdraw(address strategy, address investor, uint256 rawPrincipal) external;
+
+    // ─────────────────────────── permissionless sync ────────────────────────────
+    function sync(address strategy, uint64 code) external;
+    function syncAll(uint64 code) external;
+
+    // ─────────────────────────── owner claims ───────────────────────────────────
+    function claim(address strategy, uint64 code, address to, uint256 amount) external;
+    function claimAll(uint64 code, address to) external;
+
+    // ─────────────────────────── admin ──────────────────────────────────────────
+    function deactivateCode(uint64 code) external;
     function rescue(address token, address to, uint256 amount) external;
 
-    // owner claims
-    function claim(uint8 poolId, bytes32 code, address to, uint256 amount) external;
-    function claimAll(bytes32 code, address to) external;
-
-    // views
-    function pendingReward(uint8 poolId, bytes32 code) external view returns (uint256);
-    function pendingRewardAllPools(bytes32 code) external view returns (uint256);
+    // ─────────────────────────── views ──────────────────────────────────────────
+    function pendingReward(address strategy, uint64 code) external view returns (uint256);
+    function pendingRewardAll(uint64 code) external view returns (uint256);
 }
