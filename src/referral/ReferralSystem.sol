@@ -5,24 +5,34 @@ import "./ReferralVaultManager.sol";
 
 /**
  * @title  ReferralSystem
- * @notice The referral REGISTRY layer. It knows "who owns each code" and "which
- *         code an investor uses". It holds no money. Second layer of the chain:
+ * @notice The referral REGISTRY layer. It knows "who owns each code", "which code
+ *         an investor uses", and now "which TIER each code sits in". It holds no
+ *         money. Second layer of the chain:
  *
  *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault
  *
- *  KEY DECISION — CODES ARE CREATED BY THE ADMIN ONLY.
- *  The protocol runs offline events and hands codes to active participants, which
- *  builds community trust. Users cannot self-generate codes, so an investor cannot
- *  mint a code and refer their own second wallet. (The vault layer also blocks the
- *  degenerate self-referral where owner == depositor, as defense-in-depth.)
+ *  CODES ARE CREATED BY THE ADMIN ONLY.
+ *  The protocol hands codes to active participants at offline events. Users cannot
+ *  self-generate codes, so nobody can mint a code and refer their own second
+ *  wallet. (The vault layer also blocks owner == depositor as defense-in-depth.)
  *
  *  INVESTOR SETS THEIR CODE ONCE.
- *  Instead of passing a referral code on every deposit, an investor calls
- *  setTraderCode(code) a single time. Every future deposit automatically uses it.
- *  It is set-once (permanent) on purpose: rewards are tracked per-code, so letting
- *  someone switch codes mid-way would misattribute their already-referred capital.
- * Note: After the protocol allocated referral rewards are completed then all codes are deactivated and the referral system is retired. The referral system is not a permanent feature of the protocol.
- * It only exists to incentivize early adoption and community building. After the referral system is retired, the referral vault will be paused and all remaining ARTHA in the vault will be sent to the protocol treasury.
+ *  An investor calls updateTraderCode(code) a single time; every future deposit uses
+ *  it. Set-once on purpose — rewards are tracked per code, so switching mid-way
+ *  would misattribute already-referred capital.
+ *
+ *  TIERS (new).
+ *  Every code carries a tier (1, 2, 3, ...). The tier does NOT change the reward
+ *  math here; it only records the code's rank. The TOP layer (ReferralVault) maps
+ *  each tier to a ratio (e.g. tier 1 => 1e17, tier 2 => 3e17, tier 3 => 1e18) and
+ *  uses it in the reward formula. New codes start at tier 1. Governance promotes a
+ *  code with ReferralVault.setCodeTier(), which safely banks accrued reward at the
+ *  OLD tier before switching — see that contract.
+ *
+ *  RETIREMENT.
+ *  The referral program is temporary. Once the referral ARTHA budget is exhausted,
+ *  all codes are deactivated, the vault is paused, and any leftover ARTHA is swept
+ *  to the treasury. It is planned for intial development of protocol to raise liquidity.
  */
 contract ReferralSystem is ReferralVaultManager {
     /// @notice code => current owner (address(0) means "no code / deactivated").
@@ -37,17 +47,20 @@ contract ReferralSystem is ReferralVaultManager {
     /// @notice code => owner-approved incoming owner (pending transfer target).
     mapping(uint64 => address) public pendingCodeOwner;
 
-    event CodeCreated(uint64 code, address owner);
+    /// @notice code => tier (1, 2, 3, ...). New codes default to tier 1.
+    mapping(uint64 => uint8) public codeTier;
+
+    event CodeCreated(uint64 code, address owner, uint8 tier);
     event CodeTransferred(uint64 code, address oldOwner, address newOwner);
     event CodeDeactivated(uint64 code, address owner);
-    event TraderCodeSet(address trader, uint64 code);
+    event TraderCodeUpdate(address trader, uint64 code);
     event TransferApproved(uint64 code, address currentOwner, address proposedOwner);
     event TransferApprovalRevoked(uint64 code, address currentOwner);
-
+    event CodeTierSet(uint64 code, uint8 oldTier, uint8 newTier);
 
     constructor(address _admin) ReferralVaultManager(_admin) {}
 
-    /// @notice Create a code and assign it to an owner. ADMIN ONLY.
+    /// @notice Create a code and assign it to an owner at tier 1. ADMIN ONLY.
     function createCode(uint64 _code, address _owner) external onlyReferralVaultManager {
         require(_code != uint64(0), "INVALID_CODE");
         require(_owner != address(0), "INVALID_OWNER");
@@ -56,14 +69,13 @@ contract ReferralSystem is ReferralVaultManager {
 
         codeOwner[_code] = _owner;
         ownerToCode[_owner] = _code;
-        emit CodeCreated(_code, _owner);
+        codeTier[_code] = 1; // everyone starts at tier 1
+        emit CodeCreated(_code, _owner, 1);
     }
-
 
     /**
      * @notice Step 1 — the CURRENT code owner approves who may receive the code.
-     *         The proposed owner must not already hold a code.
-     * @param  _code        The code you own.
+     * @param  _code          The code you own.
      * @param  _proposedOwner The address you approve to take it over.
      */
     function approveTransfer(uint64 _code, address _proposedOwner) external {
@@ -76,7 +88,6 @@ contract ReferralSystem is ReferralVaultManager {
         emit TransferApproved(_code, msg.sender, _proposedOwner);
     }
 
-    
     /// @notice Owner cancels a pending approval before it is executed.
     function revokeTransferApproval(uint64 _code) external {
         require(codeOwner[_code] == msg.sender, "NOT_CODE_OWNER");
@@ -86,10 +97,9 @@ contract ReferralSystem is ReferralVaultManager {
         emit TransferApprovalRevoked(_code, msg.sender);
     }
 
-
     /**
      * @notice Step 2 — the MANAGER executes a transfer the owner already approved.
-     *         No old/new args needed: they come from storage. Clears the approval.
+     *         The code's tier travels with it (it is a property of the code).
      */
     function executeTransfer(uint64 _code) external onlyReferralVaultManager {
         address _oldOwner = codeOwner[_code];
@@ -99,7 +109,7 @@ contract ReferralSystem is ReferralVaultManager {
         require(_newOwner != address(0), "NO_PENDING_TRANSFER");
         require(ownerToCode[_newOwner] == uint64(0), "NEW_OWNER_HAS_CODE"); // re-check at execution
 
-        delete pendingCodeOwner[_code];               // erase the approval
+        delete pendingCodeOwner[_code];
 
         codeOwner[_code] = _newOwner;
         ownerToCode[_oldOwner] = uint64(0);
@@ -109,27 +119,38 @@ contract ReferralSystem is ReferralVaultManager {
 
     /**
      * @notice Link yourself (the investor) to a code, once. All future deposits
-     *         automatically credit this code — you never resend it.
-     * @param  _code An existing code (not one you own — no self-referral).
+     *         automatically credit this code — you never resend in every function
+     * @param  _code An existing code , self referral is allowed.
      */
-    function setTraderCode(uint64 _code) external {
-        require(traderToCode[msg.sender] == uint64(0), "CODE_ALREADY_SET");
+    function updateTraderCode(uint64 _code) external {
         require(codeOwner[_code] != address(0), "CODE_DOES_NOT_EXIST");
-        require(codeOwner[_code] != msg.sender, "SELF_REFERRAL");
 
         traderToCode[msg.sender] = _code;
-        emit TraderCodeSet(msg.sender, _code);
+        emit TraderCodeUpdate(msg.sender, _code);
     }
 
-    /// @dev Clear a code's ownership. The vault layer calls this AFTER checking
-    /// the code has no active balance and no unclaimed rewards. Otherwise rewards are permentanly lost.
+    /// @dev Internal tier writer. The public, settle-safe entry point lives in
+    ///      ReferralVault.setCodeTier(), which banks reward at the OLD tier first.
+    function _setCodeTier(uint64 _code, uint8 _newTier) internal {
+        require(codeOwner[_code] != address(0), "CODE_DOES_NOT_EXIST");
+        require(_newTier != 0, "INVALID_TIER");
+        uint8 old = codeTier[_code];
+        codeTier[_code] = _newTier;
+        emit CodeTierSet(_code, old, _newTier);
+    }
+
+    /// @dev Clear a code's ownership. The vault layer calls this AFTER checking the
+    ///      code has no active balance and no unclaimed rewards; else rewards are lost.
     function _deactivateCode(uint64 _code) internal {
         address owner = codeOwner[_code];
         require(owner != address(0), "ALREADY_DEACTIVATED");
         require(owner == msg.sender || msg.sender == referralVaultManager, "NOT_OWNER_OR_ADMIN");
-        
+
         codeOwner[_code] = address(0);
         ownerToCode[owner] = uint64(0);
+        codeTier[_code] = 0;
+        delete pendingCodeOwner[_code];
+        
         emit CodeDeactivated(_code, owner);
     }
 }

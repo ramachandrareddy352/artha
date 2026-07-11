@@ -5,37 +5,46 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
 
 /**
  * @title  ReferralVaultManager
- * @notice Access-control base for the whole referral stack. This is the FIRST
- *         layer of the inheritance chain:
+ * @notice Access-control base for the whole referral stack. FIRST layer of the chain:
  *
  *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault
  *
- *  ROLES:
- *   - referralVaultManager : the admin. Creates codes, sets per-pool rates,
- *                            rescues funds, pauses. Use a multisig / timelock.
- *   - approvedPools        : addresses allowed to push deposit/withdraw hooks.
- *                            In Artha this is the DIAMOND (facets run inside it
- *                            via delegatecall, so msg.sender is the Diamond).
- *                            Approve it with setPool(diamond, true).
+ *  --------------------------------
+ *  Artha is now a set of single-asset VAULTS (a USDC vault, a DAI vault, a WETH vault, ...), 
+ *  exactly like Yearn. Each vault deploys its one base token into STRATEGIES (lend, or
+ *  swap into other tokens). Reward rates are therefore keyed by the STRATEGY /
+ *  VAULT CONTRACT ADDRESS, never by the token type — because one base token
+ *  (say USDC) can back two different strategies with two different rates.
+ *
+ *  ROLES
+ *   - referralVaultManager : the admin. In production this MUST be the
+ *                            Governance Timelock. It registers strategies, sets
+ *                            per-strategy reward ratios, sets per-tier ratios,
+ *                            promotes codes between tiers, rescues funds, pauses.
+ *   - approvedCallers      : contracts allowed to report referred-balance changes
+ *                            through the notify* hooks. This is the Artha vault
+ *                            layer (the Diamond, or each standalone vault). They
+ *                            are trusted to pass the correct `strategy` address
+ *                            and the correct raw principal.
  */
 contract ReferralVaultManager is Pausable {
     /// @notice The admin address (single source of truth for the whole stack).
     address public referralVaultManager;
 
-    /// @notice Addresses allowed to call the notify* hooks (the Diamond).
-    mapping(address => bool) public approvedPools;
+    /// @notice Contracts allowed to call the notify* hooks (the vault layer).
+    mapping(address => bool) public approvedCallers;
 
     event ReferralVaultManagerUpdated(address oldManager, address newManager);
-    event PoolUpdated(address pool, bool status);
+    event CallerUpdated(address caller, bool status);
 
     modifier onlyReferralVaultManager() {
         require(msg.sender == referralVaultManager, "NOT_REFERRAL_VAULT_MANAGER");
         _;
     }
 
-    /// @notice Only an approved caller (the Diamond) may drive position updates.
-    modifier onlyPool() {
-        require(approvedPools[msg.sender], "NOT_ALLOWED_POOL");
+    /// @notice Only an approved reporter (a vault / the Diamond) may drive updates.
+    modifier onlyCaller() {
+        require(approvedCallers[msg.sender], "NOT_APPROVED_CALLER");
         _;
     }
 
@@ -46,15 +55,15 @@ contract ReferralVaultManager is Pausable {
 
     function setReferralVaultManager(address _new) external onlyReferralVaultManager {
         require(_new != address(0), "INVALID_REFERRAL_VAULT_MANAGER");
+        emit ReferralVaultManagerUpdated(referralVaultManager, _new);
         referralVaultManager = _new;
-        emit ReferralVaultManagerUpdated(msg.sender, _new);
     }
 
-    /// @notice Approve/revoke a caller (the Diamond) for the notify* hooks.
-    function setPool(address _pool, bool _status) external onlyReferralVaultManager {
-        require(_pool != address(0), "INVALID_POOL");
-        approvedPools[_pool] = _status;
-        emit PoolUpdated(_pool, _status);
+    /// @notice Approve/revoke a contract (a vault / the Diamond) for the notify* hooks.
+    function setCaller(address _caller, bool _status) external onlyReferralVaultManager {
+        require(_caller != address(0), "INVALID_CALLER");
+        approvedCallers[_caller] = _status;
+        emit CallerUpdated(_caller, _status);
     }
 
     function pause() external onlyReferralVaultManager {

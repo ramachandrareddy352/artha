@@ -20,6 +20,15 @@ enum PoolKind {
     FIXED
 }
 
+/// @notice One line of a pool's target portfolio. Expresses BOTH "what exposure"
+///         and "where it earns":
+///           - asset    : the exposure token (USDC to lend, WBTC/WETH to hold/stake)
+///           - strategy : the yield venue (address(0) = just hold `asset` idle)
+///           - weightBps: target % of pool NAV
+///         Examples: {USDC, morphoAdapter, 3000} = 30% USDC lent on Morpho;
+///                   {WBTC, address(0), 2000}     = 20% held as BTC (price exposure);
+///                   {WETH, lidoAdapter, 1500}    = 15% ETH staked (wstETH).
+
 /*//////////////////////////////////////////////////////////////////////////
                                APP STORAGE
 //////////////////////////////////////////////////////////////////////////*/
@@ -109,6 +118,10 @@ struct AppStorage {
 
     // ---- batch 3 additions ----
     mapping(address => bool) approvedSwapper;                        // DEX adapters allowed for swaps
+
+    // ---- weight-vector allocator additions ----
+    mapping(uint8 => AllocationTarget[]) poolAllocations;            // target portfolio per pool
+    mapping(uint8 => mapping(address => uint256)) maxStrategyUsdc;   // per-strategy absolute cap (0 = no cap)
 }
 
 /*//////////////////////////////////////////////////////////////////////////

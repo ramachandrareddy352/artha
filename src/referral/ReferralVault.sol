@@ -8,258 +8,382 @@ import "./ReferralSystem.sol";
 
 /**
  * @title  ReferralVault
- * @notice Top layer of the chain — holds the ARTHA and pays code OWNERS based on
- *         HOW MUCH referred capital they bring and HOW LONG it stays. Because it
- *         inherits ReferralSystem (registry) and ReferralVaultManager (admin), it
- *         reads codeOwner / traderToCode directly, with no external calls.
+ * @notice Top layer — holds the ARTHA and pays code OWNERS based on HOW MUCH
+ *         referred capital they bring, HOW LONG it stays, WHICH strategy it sits
+ *         in, and WHICH tier the code is on.
  *
- *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault  (deployed)
+ *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault (deployed)
  *
- *  ─────────────────────────────────────────────────────────────────────────
- *  THREE POOLS, DIFFERENT RATES (high risk => higher rate => more reward).
- *  Everything is tracked PER POOL: each pool has its own rate, its own
- *  accumulator, and its own per-code balances. poolId: 0=LOW, 1=MEDIUM, 2=HIGH.
+ *  ─────────────────────────────────────────────────────────────────────────────
+ *  THE REWARD FORMULA (this is the whole product, in one line)
  *
- *  THE MECHANISM (per pool): one accumulator, updated only when something changes.
- *      accArthaPerToken += currentRate * dt * ACC / (USDC_UNIT * YEAR)
- *      earned(code) = referredBalance(code) * accArthaPerToken / ACC - rewardDebt
- *  More capital -> bigger balance; more time -> bigger accumulator. No daily cron,
- *  O(1) gas, and the OWNER can claim any time (claim settles to `now` first).
+ *      rewardPerYear = (amountNorm * tierRatio * rewardRatio) / 1e36        [ARTHA/yr]
+ *      accrued       = rewardPerYear * elapsedSeconds / YEAR                [ARTHA]
  *
- *  RATE CHANGE: setRate() calls _updateIndex() FIRST (banks the old rate up to
- *  now), then writes the new rate — so old accrual keeps the old rate and only
- *  future accrual uses the new one. Zero retroactivity.
+ *    where
+ *      amountNorm  = referred principal normalised to 18 decimals
+ *                    (raw * 10^(18 - tokenDecimals); USDC*1e12, DAI/WETH*1)
+ *      rewardRatio = per-STRATEGY rate, set by governance, 0..1e18
+ *                    (e.g. a USDC strategy 1e18, a WETH strategy 5e17)
+ *      tierRatio   = per-TIER rate, set by governance, 0..1e18
+ *                    (e.g. tier1 1e17, tier2 3e17, tier3 1e18)
+ *      1e36        = 1e18 * 1e18 (normalises both ratios back out)
  *
- *  DECIMALS: balances are raw USDC (6 dp). A rate is ARTHA-wei per ONE whole USDC
- *  per year (1e18 = "1.0 ARTHA/USDC/yr"); USDC_UNIT (1e6) converts raw -> whole.
+ *    Because both ratios are capped at 1e18, their product is capped at 1e36, so
+ *    the maximum reward is 100% of the referred principal per year, in ARTHA.
  *
- *  FUNDING: does NOT mint. Mint ARTHA into this contract up front; claims transfer
- *  from balance. Admin can sweep genuine excess ARTHA or any stray token via rescue.
+ *  ─────────────────────────────────────────────────────────────────────────────
+ *  KEYED BY STRATEGY ADDRESS, NOT BY TOKEN.
+ *  All state is per `strategy` (the vault/strategy contract address). One base
+ *  token can back several strategies, each with its own rewardRatio. A referred
+ *  investor's balance is tracked per strategy, normalised to 18 dp on entry.
+ *
+ *  THE MECHANISM: MasterChef accumulators, one per (strategy, tier).
+ *      acc[strategy][tier] += rewardRatio[strategy] * tierRatio[tier] * dt * ACC
+ *                             / (1e36 * YEAR)
+ *      earned(code,strategy) = balNorm(code,strategy) * acc[strategy][codeTier]/ACC
+ *                              - rewardDebt
+ *  Folding BOTH ratios into the accumulator (not applying tier at settle) keeps
+ *  the design ZERO-RETROACTIVITY under every governance change:
+ *    - changing rewardRatio[S] : we advance all tier lanes of S first,
+ *    - changing tierRatio[t]   : we advance lane t of every strategy first,
+ *    - promoting a code's tier : we bank it in the old lane, then re-checkpoint
+ *                                it in the new lane.
+ *  Old accrual always keeps the old rates; only future accrual uses new ones.
+ *
+ *  EVERYTHING IS VARIABLE. Investors deposit/withdraw any time. There is no lock,
+ *  no fixed term. On every balance change the caller banks the code up to `now`
+ *  first, so a shrinking position simply stops accruing on the part removed and
+ *  the interest earned so far is already sitting in `earned`.
+ *
+ *  FUNDING: does NOT mint. Mint/transfer ARTHA into this contract up front; claims
+ *  pay from balance. Governance can sweep genuine excess via rescue().
  */
 contract ReferralVault is ReferralSystem, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    uint256 public constant ACC = 1e18;      // accumulator precision
-    uint256 public constant YEAR = 365 days; // seconds per year
-    uint256 public constant USDC_UNIT = 1e6; // one whole USDC (6 decimals)
+    // ---- fixed-point constants ----
+    uint256 public constant ACC = 1e18;        // accumulator precision
+    uint256 public constant YEAR = 365 days;   // seconds per year
+    uint256 public constant RATIO_ONE = 1e18;  // "1.0" for a ratio; also the cap
+    uint256 public constant RATIO_SQ = 1e36;   // RATIO_ONE * RATIO_ONE
 
-    uint8 public constant POOL_LOW = 0;
-    uint8 public constant POOL_MEDIUM = 1;
-    uint8 public constant POOL_HIGH = 2;
-    uint8 public constant POOL_COUNT = 3;
+    // ---- loop-bound safety (keep claimAll / rate changes O(bounded)) ----
+    uint256 public constant MAX_STRATEGIES = 64;
+    uint256 public constant MAX_TIERS = 8;
 
     IERC20 public immutable artha;
- 
-    /// @notice Per-pool global reward state.
-    struct PoolState {
-        uint256 currentRate;      // ARTHA-wei per whole USDC per year
-        uint256 accArthaPerToken; // accumulator (scaled by ACC)
-        uint256 lastUpdate;       // last time the accumulator advanced
-        uint256 totalReferred;    // total active referred USDC in this pool
+
+    /// @notice Global config + running totals for one strategy (all tiers).
+    struct StrategyMeta {
+        bool registered;
+        uint256 rewardRatio;       // per-strategy rate, 0..1e18
+        uint256 scale;             // 10^(18 - tokenDecimals); normalises raw -> 18dp
+        uint256 totalReferredNorm; // total active referred principal (18dp) in this strategy
     }
 
-    /// @notice Per-pool, per-code account.
+    /// @notice One MasterChef lane per (strategy, tier).
+    struct Lane {
+        uint256 accArthaPerToken; // accumulator, scaled by ACC
+        uint256 lastUpdate;       // last time this lane advanced (0 = uninitialised)
+    }
+
+    /// @notice Per (strategy, code) account.
     struct CodeAccount {
-        uint256 referredBalance;  // active referred USDC (raw 6dp)
-        uint256 rewardDebt;       // checkpoint: balance * acc / ACC at last settle
-        uint256 earned;           // settled, claimable ARTHA
-        uint256 claimed;          // lifetime claimed ARTHA (tracking)
+        uint256 balanceNorm; // active referred principal, normalised to 18dp
+        uint256 rewardDebt;  // balanceNorm * acc[strategy][codeTier]/ACC at last settle
+        uint256 earned;      // settled, claimable ARTHA
+        uint256 claimed;     // lifetime claimed ARTHA (tracking)
     }
 
-    /// @notice poolId => pool state.
-    mapping(uint8 => PoolState) public poolState;
+    mapping(address => StrategyMeta) public strategyMeta;                 // strategy => meta
+    mapping(address => mapping(uint8 => Lane)) public lane;               // strategy => tier => lane
+    mapping(address => mapping(uint64 => CodeAccount)) public codeAccount; // strategy => code => account
+    mapping(uint8 => uint256) public tierRatio;                          // tier => ratio 0..1e18
 
-    /// @notice poolId => code => account.
-    mapping(uint8 => mapping(uint64 => CodeAccount)) public codeAccount;
+    address[] public registeredStrategies;
+    uint8[] public registeredTiers;
+    mapping(uint8 => bool) private _tierKnown;
 
     // ---- vault-wide totals (rescue safety) ----
     uint256 public totalEarnedArtha;
     uint256 public totalClaimedArtha;
 
-    event RateUpdated(uint8 indexed poolId, uint256 oldRate, uint256 newRate);
-    event Referred(uint8 indexed poolId, uint64 indexed code, uint256 principal, uint256 newBalance);
-    event Unreferred(uint8 indexed poolId, uint64 indexed code, uint256 principal, uint256 newBalance);
-    event RewardSettled(uint8 indexed poolId, uint64 indexed code, uint256 pending);
-    event RewardClaimed(uint8 indexed poolId, uint64 indexed code, address indexed owner, address to, uint256 amount);
+    event StrategyRegistered(address indexed strategy, uint8 tokenDecimals, uint256 scale, uint256 rewardRatio);
+    event RewardRatioUpdated(address indexed strategy, uint256 oldRatio, uint256 newRatio);
+    event TierRatioUpdated(uint8 indexed tier, uint256 oldRatio, uint256 newRatio);
+    event CodeTierChanged(uint64 indexed code, uint8 oldTier, uint8 newTier);
+    event Referred(address indexed strategy, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
+    event Unreferred(address indexed strategy, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
+    event RewardSettled(address indexed strategy, uint64 indexed code, uint256 pending);
+    event RewardClaimed(address indexed strategy, uint64 indexed code, address indexed owner, address to, uint256 amount);
     event Rescued(address indexed token, address to, uint256 amount);
 
     constructor(address _artha, address _admin) ReferralSystem(_admin) {
         require(_artha != address(0), "INVALID_ARTHA");
         artha = IERC20(_artha);
-        // Start each pool's clock at deployment so the first rate period is measured
-        // from now (not from timestamp 0).
-        uint256 t = block.timestamp;
-        poolState[POOL_LOW].lastUpdate = t;
-        poolState[POOL_MEDIUM].lastUpdate = t;
-        poolState[POOL_HIGH].lastUpdate = t;
+
+        // Sensible defaults for the first three tiers; governance can change any of
+        // them later via setTierRatio(). Cap is 1e18 ("1.0").
+        _initTier(1, 1e17); // 0.1
+        _initTier(2, 3e17); // 0.3
+        _initTier(3, 1e18); // 1.0
     }
 
-    function _validPool(uint8 poolId) private pure {
-        require(poolId < POOL_COUNT, "INVALID_POOL_ID");
+    // ───────────────────────────── configuration ────────────────────────────────
+
+    /// @notice Register a strategy/vault so referred balances in it earn reward.
+    /// @param  strategy      The vault/strategy contract address (the reward key).
+    /// @param  tokenDecimals Decimals of that strategy's base token (USDC 6, WETH 18).
+    /// @param  rewardRatio_  Per-strategy rate, 0..1e18 (e.g. USDC 1e18, WETH 5e17).
+    function registerStrategy(address strategy, uint8 tokenDecimals, uint256 rewardRatio_)
+        external
+        onlyReferralVaultManager
+    {
+        require(strategy != address(0), "INVALID_STRATEGY");
+        require(!strategyMeta[strategy].registered, "ALREADY_REGISTERED");
+        require(tokenDecimals <= 18, "DECIMALS_GT_18");
+        require(rewardRatio_ <= RATIO_ONE, "RATIO_GT_ONE");
+        require(registeredStrategies.length < MAX_STRATEGIES, "TOO_MANY_STRATEGIES");
+
+        uint256 scale = 10 ** (18 - tokenDecimals);
+        strategyMeta[strategy] = StrategyMeta({
+            registered: true,
+            rewardRatio: rewardRatio_,
+            scale: scale,
+            totalReferredNorm: 0
+        });
+        registeredStrategies.push(strategy);
+        emit StrategyRegistered(strategy, tokenDecimals, scale, rewardRatio_);
     }
 
-    /// @dev Advance a pool's accumulator at its CURRENT rate over [lastUpdate, now].
-    ///      Safe because setRate() calls this before changing the rate.
-    function _updateIndex(uint8 poolId) internal {
-        PoolState storage p = poolState[poolId];
-        uint256 nowTs = block.timestamp;
-        if (nowTs <= p.lastUpdate) return;
-        if (p.currentRate != 0) {
-            uint256 dt = nowTs - p.lastUpdate;
-            p.accArthaPerToken += (p.currentRate * dt * ACC) / (USDC_UNIT * YEAR);
+    /// @notice Change a strategy's reward ratio. Advances EVERY tier lane of this
+    ///         strategy first, so the change is not retroactive.
+    function setRewardRatio(address strategy, uint256 newRatio) external onlyReferralVaultManager {
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
+        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
+        uint256 n = registeredTiers.length;
+        for (uint256 i = 0; i < n; i++) {
+            _updateLane(strategy, registeredTiers[i]);
         }
-        p.lastUpdate = nowTs;
+        uint256 old = strategyMeta[strategy].rewardRatio;
+        strategyMeta[strategy].rewardRatio = newRatio;
+        emit RewardRatioUpdated(strategy, old, newRatio);
     }
 
-    /// @dev Bank a code's accrued reward into `earned` and refresh its checkpoint.
-    function _settle(uint8 poolId, uint64 code) internal {
-        _updateIndex(poolId);
-        CodeAccount storage a = codeAccount[poolId][code];
-        uint256 accumulated = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC;
-        uint256 pending = accumulated - a.rewardDebt;
+    /// @notice Set a tier's ratio. Advances lane `tier` of EVERY strategy first, so
+    ///         the change is not retroactive. Adds the tier to the known set.
+    function setTierRatio(uint8 tier, uint256 newRatio) external onlyReferralVaultManager {
+        require(tier != 0, "INVALID_TIER");
+        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
+        uint256 n = registeredStrategies.length;
+        for (uint256 i = 0; i < n; i++) {
+            _updateLane(registeredStrategies[i], tier);
+        }
+        uint256 old = tierRatio[tier];
+        tierRatio[tier] = newRatio;
+        if (!_tierKnown[tier]) {
+            require(registeredTiers.length < MAX_TIERS, "TOO_MANY_TIERS");
+            _tierKnown[tier] = true;
+            registeredTiers.push(tier);
+        }
+        emit TierRatioUpdated(tier, old, newRatio);
+    }
+
+    /// @notice Promote/demote a code's tier. Banks the code at its OLD tier lane in
+    ///         every strategy, switches the tier, then re-checkpoints in the NEW
+    ///         lane — so accrual before the change keeps the old tier's rate.
+    function setCodeTier(uint64 code, uint8 newTier) external onlyReferralVaultManager {
+        require(codeOwner[code] != address(0), "CODE_DOES_NOT_EXIST");
+        require(newTier != 0, "INVALID_TIER");
+
+        uint256 n = registeredStrategies.length;
+        // 1) bank everything at the current (old) tier.
+        for (uint256 i = 0; i < n; i++) {
+            _settle(registeredStrategies[i], code);
+        }
+        // 2) switch the tier (registry write).
+        uint8 oldTier = codeTier[code];
+        _setCodeTier(code, newTier);
+        // 3) re-checkpoint against the new tier's lane so future accrual uses it.
+        for (uint256 i = 0; i < n; i++) {
+            address s = registeredStrategies[i];
+            _updateLane(s, newTier);
+            CodeAccount storage a = codeAccount[s][code];
+            a.rewardDebt = (a.balanceNorm * lane[s][newTier].accArthaPerToken) / ACC;
+        }
+        emit CodeTierChanged(code, oldTier, newTier);
+    }
+
+    // ───────────────────────────── accrual core ─────────────────────────────────
+
+    /// @dev Advance one (strategy, tier) lane at the CURRENT rates over [last, now].
+    ///      Lazily initialises lastUpdate so an untouched lane never back-pays.
+    function _updateLane(address strategy, uint8 tier) internal {
+        Lane storage L = lane[strategy][tier];
+        uint256 nowTs = block.timestamp;
+        if (L.lastUpdate == 0) {
+            L.lastUpdate = nowTs; // first touch: start the clock, accrue nothing
+            return;
+        }
+        if (nowTs <= L.lastUpdate) return;
+
+        uint256 rr = strategyMeta[strategy].rewardRatio;
+        uint256 tr = tierRatio[tier];
+        if (rr != 0 && tr != 0) {
+            uint256 dt = nowTs - L.lastUpdate;
+            // acc += rewardRatio * tierRatio * dt * ACC / (1e36 * YEAR)
+            L.accArthaPerToken += (rr * tr * dt * ACC) / (RATIO_SQ * YEAR);
+        }
+        L.lastUpdate = nowTs;
+    }
+
+    /// @dev Bank a code's accrued reward in one strategy into `earned`, using the
+    ///      code's CURRENT tier lane, then refresh its checkpoint.
+    function _settle(address strategy, uint64 code) internal {
+        uint8 tier = codeTier[code];
+        _updateLane(strategy, tier);
+        CodeAccount storage a = codeAccount[strategy][code];
+        uint256 accumulated = (a.balanceNorm * lane[strategy][tier].accArthaPerToken) / ACC;
+        uint256 pending = accumulated - a.rewardDebt; // monotonic acc => never underflows
         if (pending != 0) {
             a.earned += pending;
             totalEarnedArtha += pending;
-            emit RewardSettled(poolId, code, pending);
+            emit RewardSettled(strategy, code, pending);
         }
         a.rewardDebt = accumulated;
     }
 
+    // ─────────────────────────────── hooks ──────────────────────────────────────
+
     /**
-     * @notice A referred deposit into `poolId`. The code is looked up from the
+     * @notice A referred deposit into `strategy`. The code is read from the
      *         investor's stored traderToCode — the investor never resends it.
-     * @param  poolId    0=LOW, 1=MEDIUM, 2=HIGH.
-     * @param  investor  The depositor.
-     * @param  principal Referred USDC amount (raw, 6 decimals).
+     * @param  strategy     The vault/strategy contract that custodies the principal.
+     * @param  investor     The depositor.
+     * @param  rawPrincipal Referred amount in the strategy's base-token decimals.
      */
-    function notifyDeposit(uint8 poolId, address investor, uint256 principal)
+    function notifyDeposit(address strategy, address investor, uint256 rawPrincipal)
         external
-        onlyPool
+        onlyCaller
         whenNotPaused
     {
-        _validPool(poolId);
-        if (principal == 0) return;
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
+        if (rawPrincipal == 0) return;
 
         uint64 code = traderToCode[investor];
-        if (code == uint64(0)) return;                        // investor set no code
+        if (code == uint64(0)) return;                         // investor set no code
         address owner = codeOwner[code];
-        if (owner == address(0) || owner == investor) return; // deactivated / self-referral
+        if (owner == address(0) || owner == investor) return;  // deactivated / self-referral
 
-        _settle(poolId, code);                                // bank at OLD balance
-        CodeAccount storage a = codeAccount[poolId][code];
-        a.referredBalance += principal;
-        poolState[poolId].totalReferred += principal;
-        a.rewardDebt = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC; // re-checkpoint
+        _settle(strategy, code);                               // bank at OLD balance
+        uint256 addNorm = rawPrincipal * strategyMeta[strategy].scale;
+        CodeAccount storage a = codeAccount[strategy][code];
+        a.balanceNorm += addNorm;
+        strategyMeta[strategy].totalReferredNorm += addNorm;
+        // re-checkpoint at the new balance in the code's current tier lane
+        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].accArthaPerToken) / ACC;
 
-        emit Referred(poolId, code, principal, a.referredBalance);
+        emit Referred(strategy, code, rawPrincipal, a.balanceNorm);
     }
 
     /**
-     * @notice A referred position in `poolId` shrinks or fully exits.
-     * @param  poolId    0=LOW, 1=MEDIUM, 2=HIGH.
-     * @param  investor  The withdrawing depositor (its stored code is reduced).
-     * @param  principal USDC leaving (raw, 6 decimals).
+     * @notice A referred position in `strategy` shrinks or fully exits.
+     * @param  strategy     The vault/strategy contract.
+     * @param  investor     The withdrawing depositor.
+     * @param  rawPrincipal Amount leaving, in base-token decimals.
      */
-    function notifyWithdraw(uint8 poolId, address investor, uint256 principal)
+    function notifyWithdraw(address strategy, address investor, uint256 rawPrincipal)
         external
-        onlyPool
+        onlyCaller
         whenNotPaused
     {
-        _validPool(poolId);
-        if (principal == 0) return;
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
+        if (rawPrincipal == 0) return;
 
         uint64 code = traderToCode[investor];
         if (code == uint64(0)) return;
 
-        CodeAccount storage a = codeAccount[poolId][code];
-        uint256 bal = a.referredBalance;
-        if (bal == 0) return;
+        CodeAccount storage a = codeAccount[strategy][code];
+        if (a.balanceNorm == 0) return;
 
-        _settle(poolId, code);                        // bank up to now first
+        _settle(strategy, code);                               // bank up to now first
 
-        uint256 dec = principal > bal ? bal : principal; // clamp (defensive)
-        a.referredBalance = bal - dec;
-        poolState[poolId].totalReferred -= dec;
-        a.rewardDebt = (a.referredBalance * poolState[poolId].accArthaPerToken) / ACC;
+        uint256 decNorm = rawPrincipal * strategyMeta[strategy].scale;
+        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm;  // clamp (defensive)
+        a.balanceNorm -= decNorm;
+        strategyMeta[strategy].totalReferredNorm -= decNorm;
+        a.rewardDebt = (a.balanceNorm * lane[strategy][codeTier[code]].accArthaPerToken) / ACC;
 
-        emit Unreferred(poolId, code, dec, a.referredBalance);
+        emit Unreferred(strategy, code, rawPrincipal, a.balanceNorm);
     }
 
-    /// @notice Permissionless: bring a code's `earned` up to date in a pool.
-    function sync(uint8 poolId, uint64 code) external {
-        _validPool(poolId);
-        _settle(poolId, code);
+    /// @notice Permissionless: bring a code's `earned` in one strategy up to date.
+    function sync(address strategy, uint64 code) external {
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
+        _settle(strategy, code);
     }
 
-    /**
-     * @notice Set a pool's reward rate. Banks the old rate up to `now` FIRST, so
-     *         the change is not retroactive. Higher pool = higher rate.
-     * @param  poolId  0=LOW, 1=MEDIUM, 2=HIGH.
-     * @param  newRate ARTHA-wei per whole USDC per year (e.g. 2e17 = 0.2, 1e18 = 1.0).
-     */
-    function setRate(uint8 poolId, uint256 newRate) external onlyReferralVaultManager {
-        _validPool(poolId);
-        _updateIndex(poolId); // freeze old-rate accrual up to this instant
-        uint256 old = poolState[poolId].currentRate;
-        poolState[poolId].currentRate = newRate;
-        emit RateUpdated(poolId, old, newRate);
-    }
+    // ─────────────────────────────── claiming ───────────────────────────────────
 
-    /// @notice The code's CURRENT owner withdraws its ARTHA from one pool.
-    function claim(uint8 poolId, uint64 code, address to, uint256 amount)
+    /// @notice The code's CURRENT owner withdraws its ARTHA from one strategy.
+    function claim(address strategy, uint64 code, address to, uint256 amount)
         public
         nonReentrant
         whenNotPaused
     {
-        _validPool(poolId);
+        require(strategyMeta[strategy].registered, "NOT_REGISTERED");
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
 
-        _settle(poolId, code); // bring current to now
-        CodeAccount storage a = codeAccount[poolId][code];
+        _settle(strategy, code);
+        CodeAccount storage a = codeAccount[strategy][code];
         require(a.earned >= amount, "INSUFFICIENT_REWARDS");
 
-        a.earned -= amount;               // effect (checks-effects-interactions)
+        a.earned -= amount;               // checks-effects-interactions
         a.claimed += amount;
         totalClaimedArtha += amount;
-        artha.safeTransfer(to, amount);   // transfer rewards
-        emit RewardClaimed(poolId, code, msg.sender, to, amount);
+        artha.safeTransfer(to, amount);
+        emit RewardClaimed(strategy, code, msg.sender, to, amount);
     }
 
-    /// @notice Convenience: claim the full earned balance from every pool at once.
+    /// @notice Claim the full earned balance across every registered strategy.
     function claimAll(uint64 code, address to) external {
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
-        for (uint8 i = 0; i < POOL_COUNT; i++) {
-            _settle(i, code);
-            uint256 amt = codeAccount[i][code].earned;
-            if (amt != 0) {
-                claim(i, code, to, amt); // reuses owner check + transfer (nonReentrant per call)
-            }
+        uint256 n = registeredStrategies.length;
+        for (uint256 i = 0; i < n; i++) {
+            address s = registeredStrategies[i];
+            _settle(s, code);
+            uint256 amt = codeAccount[s][code].earned;
+            if (amt != 0) claim(s, code, to, amt); // reuses owner check + nonReentrant
         }
     }
 
     /**
-     * @notice Deactivate a code. Requires it to be fully wound down first: no
-     *         active referred balance and no unclaimed rewards in ANY pool. This
-     *         Executed by code owner or admin.
+     * @notice Deactivate a code. Requires it to be fully wound down first in EVERY
+     *         strategy: no active balance and no unclaimed rewards anywhere.
+     *         Callable by the code owner or the admin.
      */
     function deactivateCode(uint64 code) external {
-        for (uint8 i = 0; i < POOL_COUNT; i++) {
-            _settle(i, code);
-            CodeAccount storage a = codeAccount[i][code];
-            require(a.referredBalance == 0, "HAS_ACTIVE_BALANCE");
+        uint256 n = registeredStrategies.length;
+        for (uint256 i = 0; i < n; i++) {
+            address s = registeredStrategies[i];
+            _settle(s, code);
+            CodeAccount storage a = codeAccount[s][code];
+            require(a.balanceNorm == 0, "HAS_ACTIVE_BALANCE");
             require(a.earned == 0, "HAS_UNCLAIMED_REWARDS");
         }
-        _deactivateCode(code); // parent (registry) internal
+        _deactivateCode(code);
     }
 
+    // ─────────────────────────────── rescue ─────────────────────────────────────
+
     /**
-     * @notice ONE function to recover funds the vault should not keep:
-     *           - excess ARTHA (above what is owed), or any other stray token.
-     * @dev    For ARTHA, capped to `balance - settledUnclaimed`, so it can never
-     *         touch rewards already credited. NOTE: reward still accruing on active
-     *         codes is not reserved here — keep the vault funded above ongoing
-     *         accrual and only sweep clear excess.
+     * @notice Recover funds the vault should not keep: excess ARTHA (above what is
+     *         already settled-and-unclaimed) or any stray token.
+     * @dev    For ARTHA the cap is `balance - (totalEarned - totalClaimed)`. Reward
+     *         still accruing on active codes is NOT reserved here — keep the vault
+     *         funded above ongoing accrual and only sweep clear excess.
      */
     function rescue(address token, address to, uint256 amount) external onlyReferralVaultManager {
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
@@ -273,24 +397,45 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
         emit Rescued(token, to, amount);
     }
 
-    /// @notice Live claimable reward for a code in a pool (settled + accruing).
-    function pendingReward(uint8 poolId, uint64 code) public view returns (uint256) {
-        PoolState storage p = poolState[poolId];
-        uint256 accNow = p.accArthaPerToken;
-        if (block.timestamp > p.lastUpdate && p.currentRate != 0) {
-            uint256 dt = block.timestamp - p.lastUpdate;
-            accNow += (p.currentRate * dt * ACC) / (USDC_UNIT * YEAR);
+    // ─────────────────────────────── views ──────────────────────────────────────
+
+    /// @notice Live claimable reward for a code in one strategy (settled + accruing).
+    function pendingReward(address strategy, uint64 code) public view returns (uint256) {
+        uint8 tier = codeTier[code];
+        Lane storage L = lane[strategy][tier];
+        uint256 accNow = L.accArthaPerToken;
+        uint256 rr = strategyMeta[strategy].rewardRatio;
+        uint256 tr = tierRatio[tier];
+        if (L.lastUpdate != 0 && block.timestamp > L.lastUpdate && rr != 0 && tr != 0) {
+            uint256 dt = block.timestamp - L.lastUpdate;
+            accNow += (rr * tr * dt * ACC) / (RATIO_SQ * YEAR);
         }
-        CodeAccount storage a = codeAccount[poolId][code];
-        uint256 accumulated = (a.referredBalance * accNow) / ACC;
+        CodeAccount storage a = codeAccount[strategy][code];
+        uint256 accumulated = (a.balanceNorm * accNow) / ACC;
         return a.earned + (accumulated - a.rewardDebt);
     }
 
-    /// @notice Total live claimable for a code across all three pools.
-    function pendingRewardAllPools(uint64 code) external view returns (uint256 total) {
-        for (uint8 i = 0; i < POOL_COUNT; i++) {
-            total += pendingReward(i, code);
+    /// @notice Total live claimable for a code across every registered strategy.
+    function pendingRewardAll(uint64 code) external view returns (uint256 total) {
+        uint256 n = registeredStrategies.length;
+        for (uint256 i = 0; i < n; i++) {
+            total += pendingReward(registeredStrategies[i], code);
         }
     }
 
+    function strategiesCount() external view returns (uint256) {
+        return registeredStrategies.length;
+    }
+
+    function tiersCount() external view returns (uint256) {
+        return registeredTiers.length;
+    }
+
+    // ─────────────────────────────── internal ───────────────────────────────────
+
+    function _initTier(uint8 tier, uint256 ratio) private {
+        tierRatio[tier] = ratio;
+        _tierKnown[tier] = true;
+        registeredTiers.push(tier);
+    }
 }

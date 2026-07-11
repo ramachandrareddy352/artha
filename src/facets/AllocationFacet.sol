@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {Modifiers, AppStorage} from "../libraries/LibAppStorage.sol";
+import {Modifiers, AppStorage, AllocationTarget} from "../libraries/LibAppStorage.sol";
 import {LibStrategy} from "../libraries/LibStrategy.sol";
 import {LibNav} from "../libraries/LibNav.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
@@ -39,6 +39,8 @@ contract AllocationFacet is Modifiers {
     event Undeployed(uint8 indexed poolId, address indexed token, address strategy, uint256 amount);
     event Swapped(uint8 indexed poolId, address tokenIn, address tokenOut, uint256 amountIn, uint256 amountOut);
     event Harvested(uint8 indexed poolId, address strategy, uint256 rewards);
+    event AllocationsSet(uint8 indexed poolId, uint256 targetCount);
+    event MaxStrategyUsdcSet(uint8 indexed poolId, address indexed strategy, uint256 capUsdc);
 
     /*//////////////////////////////////////////////////////////////
                        GOVERNANCE — BOUNDS / CONFIG
@@ -100,6 +102,59 @@ contract AllocationFacet is Modifiers {
     }
 
     /*//////////////////////////////////////////////////////////////
+                   GOVERNANCE — WEIGHT-VECTOR ALLOCATOR
+    //////////////////////////////////////////////////////////////*/
+
+    /**
+     * @notice Set a pool's full target portfolio as a vector of {asset, strategy,
+     *         weightBps}. This is the professional allocator model (Yearn/Enzyme):
+     *         one list expresses every position — lend legs, hold legs, staking legs
+     *         — and the executor rebalances toward it. Weights must leave the buffer.
+     *
+     *  Validation: each asset whitelisted (or USDC); each strategy (if set) matches
+     *  its asset; per-asset weight <= maxWeight; meme sum <= cap; sum + minBuffer <= 100%.
+     */
+    function setAllocations(uint8 poolId, AllocationTarget[] calldata targets)
+        external
+        onlyGovernance
+        validPool(poolId)
+    {
+        require(targets.length <= 12, "TOO_MANY_TARGETS");
+
+        uint256 sum;
+        uint256 memeSum;
+        for (uint256 i; i < targets.length; i++) {
+            AllocationTarget calldata t = targets[i];
+            require(t.asset == s.usdc || s.whitelisted[t.asset], "ASSET_NOT_WHITELISTED");
+            require(t.weightBps <= s.maxWeightBps[poolId], "WEIGHT_OVER_CAP");
+            if (t.strategy != address(0)) {
+                require(IStrategy(t.strategy).underlying() == t.asset, "STRATEGY_UNDERLYING_MISMATCH");
+            }
+            if (s.isMemeClass[t.asset]) memeSum += t.weightBps;
+            sum += t.weightBps;
+        }
+        require(sum + s.minBufferBps[poolId] <= 10000, "BUFFER_NOT_RESERVED");
+        require(memeSum <= s.maxMemeBps[poolId], "MEME_OVER_CAP");
+
+        // replace the stored vector
+        delete s.poolAllocations[poolId];
+        for (uint256 i; i < targets.length; i++) {
+            s.poolAllocations[poolId].push(targets[i]);
+        }
+        emit AllocationsSet(poolId, targets.length);
+    }
+
+    /// @notice Cap the absolute USDC a single strategy may hold for a pool (0 = uncapped).
+    function setMaxStrategyUsdc(uint8 poolId, address strategy, uint256 capUsdc)
+        external
+        onlyGovernance
+        validPool(poolId)
+    {
+        s.maxStrategyUsdc[poolId][strategy] = capUsdc;
+        emit MaxStrategyUsdcSet(poolId, strategy, capUsdc);
+    }
+
+    /*//////////////////////////////////////////////////////////////
                         EXECUTOR — BOUNDED OPERATIONS
     //////////////////////////////////////////////////////////////*/
 
@@ -119,6 +174,12 @@ contract AllocationFacet is Modifiers {
         IStrategy(strat).deposit(poolId, amount);
         IERC20(token).forceApprove(strat, 0);
         LibStrategy.addStrategy(s, poolId, strat);
+
+        // enforce the per-strategy absolute cap (0 = uncapped)
+        uint256 cap = s.maxStrategyUsdc[poolId][strat];
+        if (cap != 0) {
+            require(IStrategy(strat).totalValue(poolId) <= cap, "STRATEGY_CAP_EXCEEDED");
+        }
 
         emit Deployed(poolId, token, strat, amount);
     }
@@ -217,5 +278,46 @@ contract AllocationFacet is Modifiers {
 
     function poolStrategies(uint8 poolId) external view returns (address[] memory) {
         return s.poolStrategies[poolId];
+    }
+
+    /// @notice The pool's stored target portfolio vector.
+    function allocationTargets(uint8 poolId) external view returns (AllocationTarget[] memory) {
+        return s.poolAllocations[poolId];
+    }
+
+    /**
+     * @notice Rebalance helper: for each target, the current USDC value, target USDC
+     *         value, and signed delta (target - current). Positive delta = buy/deploy
+     *         more; negative = sell/undeploy. The executor reads this off-chain to
+     *         build the exact swap/deploy/undeploy calls (each still RiskGuard-bounded).
+     */
+    function rebalanceDeltas(uint8 poolId)
+        external
+        view
+        returns (uint256 nav, uint256[] memory currentUsdc, uint256[] memory targetUsdc, int256[] memory deltaUsdc)
+    {
+        nav = LibNav.totalAssets(poolId);
+        AllocationTarget[] storage targets = s.poolAllocations[poolId];
+        uint256 n = targets.length;
+        currentUsdc = new uint256[](n);
+        targetUsdc = new uint256[](n);
+        deltaUsdc = new int256[](n);
+
+        for (uint256 i; i < n; i++) {
+            AllocationTarget storage t = targets[i];
+            uint256 cur;
+            if (t.strategy != address(0)) {
+                cur = IStrategy(t.strategy).totalValue(poolId);
+            } else if (t.asset == s.usdc) {
+                cur = s.idleUsdc[poolId];
+            } else {
+                uint256 bal = s.poolTokenBalance[poolId][t.asset];
+                if (bal != 0) cur = IOracle(s.oracle).valueInUsdc(t.asset, bal);
+            }
+            uint256 tgt = (nav * t.weightBps) / 10000;
+            currentUsdc[i] = cur;
+            targetUsdc[i] = tgt;
+            deltaUsdc[i] = int256(tgt) - int256(cur);
+        }
     }
 }
