@@ -17,7 +17,7 @@ import "./ReferralVaultManager.sol";
  *  wallet. (The vault layer also blocks owner == depositor as defense-in-depth.)
  *
  *  INVESTOR SETS THEIR CODE ONCE.
- *  An investor calls updateTraderCode(code) a single time; every future deposit uses
+ *  An investor calls setTraderCode(code) a single time; every future deposit uses
  *  it. Set-once on purpose — rewards are tracked per code, so switching mid-way
  *  would misattribute already-referred capital.
  *
@@ -53,7 +53,7 @@ contract ReferralSystem is ReferralVaultManager {
     event CodeCreated(uint64 code, address owner, uint8 tier);
     event CodeTransferred(uint64 code, address oldOwner, address newOwner);
     event CodeDeactivated(uint64 code, address owner);
-    event TraderCodeUpdate(address trader, uint64 code);
+    event TraderCodeSet(address trader, uint64 code);
     event TransferApproved(uint64 code, address currentOwner, address proposedOwner);
     event TransferApprovalRevoked(uint64 code, address currentOwner);
     event CodeTierSet(uint64 code, uint8 oldTier, uint8 newTier);
@@ -119,14 +119,16 @@ contract ReferralSystem is ReferralVaultManager {
 
     /**
      * @notice Link yourself (the investor) to a code, once. All future deposits
-     *         automatically credit this code — you never resend in every function
+     *         automatically credit this code — olny set once
      * @param  _code An existing code , self referral is allowed.
      */
-    function updateTraderCode(uint64 _code) external {
+    function setTraderCode(uint64 _code) external {
+        require(_code != uint64(0), "INVALID_CODE");
         require(codeOwner[_code] != address(0), "CODE_DOES_NOT_EXIST");
+        require(traderToCode[msg.sender] == uint64(0), "CODE_ALREADY_SET");
 
         traderToCode[msg.sender] = _code;
-        emit TraderCodeUpdate(msg.sender, _code);
+        emit TraderCodeSet(msg.sender, _code);
     }
 
     /// @dev Internal tier writer. The public, settle-safe entry point lives in
@@ -134,6 +136,7 @@ contract ReferralSystem is ReferralVaultManager {
     function _setCodeTier(uint64 _code, uint8 _newTier) internal {
         require(codeOwner[_code] != address(0), "CODE_DOES_NOT_EXIST");
         require(_newTier != 0, "INVALID_TIER");
+        
         uint8 old = codeTier[_code];
         codeTier[_code] = _newTier;
         emit CodeTierSet(_code, old, _newTier);
