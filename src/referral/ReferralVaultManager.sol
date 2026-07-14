@@ -12,19 +12,19 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
  *  --------------------------------
  *  Artha is now a set of single-asset VAULTS (a USDC vault, a DAI vault, a WETH vault, ...), 
  *  exactly like Yearn. Each vault deploys its one base token into STRATEGIES (lend, or
- *  swap into other tokens). Reward rates are therefore keyed by the STRATEGY /
+ *  swap into other tokens). Reward rates are therefore keyed by the
  *  VAULT CONTRACT ADDRESS, never by the token type — because one base token
  *  (say USDC) can back two different strategies with two different rates.
  *
  *  ROLES
  *   - referralVaultManager : the admin. In production this MUST be the
  *                            Governance Timelock. It registers strategies, sets
- *                            per-strategy reward ratios, sets per-tier ratios,
+ *                            per-vault reward ratios, sets per-tier ratios,
  *                            promotes codes between tiers, rescues funds, pauses.
  *   - approvedCallers      : contracts allowed to report referred-balance changes
  *                            through the notify* hooks. This is the Artha vault
  *                            layer (the Diamond, or each standalone vault). They
- *                            are trusted to pass the correct `strategy` address
+ *                            are trusted to pass the correct `vault` address
  *                            and the correct raw principal.
  */
 contract ReferralVaultManager is Pausable {
@@ -42,7 +42,7 @@ contract ReferralVaultManager is Pausable {
         _;
     }
 
-    /// @notice Only an approved reporter (a vault / the Diamond) may drive updates.
+    /// @notice Only an approved reporter (only vault) may drive updates.
     modifier onlyCaller() {
         require(approvedCallers[msg.sender], "NOT_APPROVED_CALLER");
         _;

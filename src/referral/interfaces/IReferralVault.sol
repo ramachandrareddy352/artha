@@ -9,14 +9,14 @@ import "./IReferralSystem.sol";
  *         manager surfaces). This is the interface the Artha vault layer imports to
  *         drive referred deposits/withdrawals, and that code owners use to claim.
  *
- *  KEYED BY STRATEGY ADDRESS (not pool, not token). One base token can back several
- *  strategies, each with its own rewardRatio. Reward for a (strategy, tier) position
- *  is:  (amountNorm * tierRatio[tier] * rewardRatio[strategy]) / 1e36 per YEAR,
+ *  KEYED BY VAULT ADDRESS (not pool, not token). One base token can back several
+ *  vaults, each with its own rewardRatio. Reward for a (vault, tier) position
+ *  is:  (amountNorm * tierRatio[tier] * rewardRatio[vault]) / 1e36 per YEAR,
  *  with YEAR = 360 days and both ratios capped at 1e18.
  *
  *  Caller sites (msg.sender must be an approved caller = the vault / Diamond):
- *     - referred deposit -> notifyDeposit(strategy, investor, rawPrincipal)
- *     - referred exit     -> notifyWithdraw(strategy, investor, rawPrincipal)
+ *     - referred deposit -> notifyDeposit(vault, investor, rawPrincipal)
+ *     - referred exit     -> notifyWithdraw(vault, investor, rawPrincipal)
  *  (The code is resolved from the investor's one-time traderToCode.)
  *
  *  Anyone may sync()/syncAll() to bank a code's pending into claimable `earned`
@@ -34,16 +34,16 @@ interface IReferralVault is IReferralSystem {
     function MAX_TIERS() external view returns (uint8);
     function artha() external view returns (address);
 
-    // ─────────────────────────── strategy config / books ────────────────────────
-    /// @return registered        whether the strategy is active
+    // ─────────────────────────── vault config / books ───────────────────────────
+    /// @return registered        whether the vault is active
     /// @return decimals          base-token decimals
-    /// @return rewardRatio       per-strategy rate (0..1e18)
+    /// @return rewardRatio       per-vault rate (0..1e18)
     /// @return scale             10^(18 - decimals)
     /// @return totalPrincipalRaw live referred principal, raw base-token units
     /// @return totalReferredNorm live referred principal, normalised 18dp
-    /// @return totalArthaEarned  cumulative ARTHA credited for this strategy
-    /// @return totalArthaClaimed cumulative ARTHA claimed from this strategy
-    function strategyMeta(address strategy)
+    /// @return totalArthaEarned  cumulative ARTHA credited for this vault
+    /// @return totalArthaClaimed cumulative ARTHA claimed from this vault
+    function vaultMeta(address vault)
         external
         view
         returns (
@@ -57,10 +57,10 @@ interface IReferralVault is IReferralSystem {
             uint256 totalArthaClaimed
         );
 
-    function strategyCount() external view returns (uint64);
+    function vaultCount() external view returns (uint64);
 
-    /// @notice Convenience read of a strategy's books.
-    function strategyBooks(address strategy)
+    /// @notice Convenience read of a vault's books.
+    function vaultBooks(address vault)
         external
         view
         returns (
@@ -80,48 +80,48 @@ interface IReferralVault is IReferralSystem {
     function tiersCount() external view returns (uint256);
 
     // ─────────────────────────── lanes & accounts ───────────────────────────────
-    /// @return init            whether this (strategy,tier) lane has been touched
+    /// @return init            whether this (vault,tier) lane has been touched
     /// @return acc             ARTHA-per-normalised-token accumulator (scaled by ACC)
     /// @return tierSecondsMark accTierSeconds[tier] snapshot at last advance
-    function lane(address strategy, uint8 tier)
+    function lane(address vault, uint8 tier)
         external
         view
         returns (bool init, uint256 acc, uint256 tierSecondsMark);
 
-    /// @return balanceNorm live referred principal for this (strategy,code), 18dp
+    /// @return balanceNorm live referred principal for this (vault,code), 18dp
     /// @return rewardDebt  checkpoint = balanceNorm * lane.acc / ACC at last settle
     /// @return earned      settled, claimable ARTHA
     /// @return claimed     lifetime claimed ARTHA
-    function codeAccount(address strategy, uint64 code)
+    function codeAccount(address vault, uint64 code)
         external
         view
         returns (uint256 balanceNorm, uint256 rewardDebt, uint256 earned, uint256 claimed);
 
     // ─────────────────────────── per-code footprint ─────────────────────────────
-    function codeStrategies(uint64 code, uint256 index) external view returns (address);
-    function codeHasStrategy(uint64 code, address strategy) external view returns (bool);
-    function codeStrategiesCount(uint64 code) external view returns (uint256);
+    function codeVaults(uint64 code, uint256 index) external view returns (address);
+    function codeHasVault(uint64 code, address vault) external view returns (bool);
+    function codeVaultsCount(uint64 code) external view returns (uint256);
 
     // ─────────────────────────── vault-wide totals ──────────────────────────────
     function totalEarnedArtha() external view returns (uint256);
     function totalClaimedArtha() external view returns (uint256);
 
     // ─────────────────────────── configuration (governance) ─────────────────────
-    function registerStrategy(address strategy, uint8 decimals, uint256 rewardRatio_) external;
-    function setRewardRatio(address strategy, uint256 newRatio) external;
+    function registerVault(address vault, uint8 decimals, uint256 rewardRatio_) external;
+    function setRewardRatio(address vault, uint256 newRatio) external;
     function setTierRatio(uint8 tier, uint256 newRatio) external;
     function setCodeTier(uint64 code, uint8 newTier) external;
 
     // ─────────────────────────── hooks (approved caller) ────────────────────────
-    function notifyDeposit(address strategy, address investor, uint256 rawPrincipal) external;
-    function notifyWithdraw(address strategy, address investor, uint256 rawPrincipal) external;
+    function notifyDeposit(address vault, address investor, uint256 rawPrincipal) external;
+    function notifyWithdraw(address vault, address investor, uint256 rawPrincipal) external;
 
     // ─────────────────────────── permissionless sync ────────────────────────────
-    function sync(address strategy, uint64 code) external;
+    function sync(address vault, uint64 code) external;
     function syncAll(uint64 code) external;
 
     // ─────────────────────────── owner claims ───────────────────────────────────
-    function claim(address strategy, uint64 code, address to, uint256 amount) external;
+    function claim(address vault, uint64 code, address to, uint256 amount) external;
     function claimAll(uint64 code, address to) external;
 
     // ─────────────────────────── admin ──────────────────────────────────────────
@@ -129,6 +129,6 @@ interface IReferralVault is IReferralSystem {
     function rescue(address token, address to, uint256 amount) external;
 
     // ─────────────────────────── views ──────────────────────────────────────────
-    function pendingReward(address strategy, uint64 code) external view returns (uint256);
+    function pendingReward(address vault, uint64 code) external view returns (uint256);
     function pendingRewardAll(uint64 code) external view returns (uint256);
 }
