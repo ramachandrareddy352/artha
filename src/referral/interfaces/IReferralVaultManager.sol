@@ -3,24 +3,20 @@ pragma solidity ^0.8.20;
 
 /**
  * @title  IReferralVaultManager
- * @notice Admin / access-control surface of the referral stack (first layer).
+ * @notice Access-control surface. FIRST layer of the chain:
  *
  *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault
  *
- *  Roles:
- *   - referralVaultManager : the admin (Governance Timelock in production).
- *   - approvedCallers      : contracts allowed to push the notify* hooks (the
- *                            Artha vault layer / the Diamond).
- *
- *  Events are emitted by the implementation; they are intentionally omitted here
- *  so a contract may `is IReferralVaultManager` without duplicate-event clashes.
+ *  `referralVaultManager` is the admin (the Governance Timelock in production).
+ *  `approvedCallers` are the Artha vault Diamonds allowed to drive the notify*
+ *  hooks. A caller may ONLY report under its OWN address -- the implementation's
+ *  `onlyCaller(address vault)` modifier enforces `msg.sender == vault`.
  */
 interface IReferralVaultManager {
-    // ---- state getters ----
     function referralVaultManager() external view returns (address);
     function approvedCallers(address caller) external view returns (bool);
+    function paused() external view returns (bool);
 
-    // ---- admin ----
     function setReferralVaultManager(address newManager) external;
     function setCaller(address caller, bool status) external;
     function pause() external;

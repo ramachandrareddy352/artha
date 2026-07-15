@@ -23,6 +23,45 @@ import "./ReferralSystem.sol";
  *    YEAR        = 360 days  (protocol convention)
  *    Both ratios cap at 1e18 -> max reward = 100% of principal per year.
  *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   THE CODE IS BOUND TO THE POSITION, NOT TO AN ADDRESS
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  `positionCode[vault][tokenId]` is the code that referred a given position. It
+ *  is bound ONCE, on that position's first referred deposit, and is immutable for
+ *  the life of the position. The Artha vault stores the code in its own position
+ *  storage and passes it in on every hook.
+ *
+ *  This replaces the old `traderToCode[investor]` lookup, which was BROKEN because
+ *  anyone may deposit into anyone's position but only the OWNER may withdraw --
+ *  so the deposit hook and the withdraw hook resolved DIFFERENT codes, and the
+ *  books could never close. A depositor's code kept a referral balance alive
+ *  forever after the position was emptied and closed. See ReferralSystem's
+ *  contract-level comment for the full walkthrough of that failure.
+ *
+ *      ┌────────────────────────────────────────────────────────────┐
+ *      │  DEPOSIT  credits positionCode[vault][id].                 │
+ *      │  WITHDRAW debits  positionCode[vault][id].                 │
+ *      │  SAME KEY. ALWAYS.                                         │
+ *      │                                                            │
+ *      │  balanceNorm[code] is therefore the exact sum of the live  │
+ *      │  principal of every position bound to that code. It cannot │
+ *      │  be stranded and cannot underflow.                        │
+ *      └────────────────────────────────────────────────────────────┘
+ *
+ *  WHY IMMUTABLE ONCE BOUND. If a position could re-bind to a new code, a user
+ *  could park capital under code A for a year, then re-point it at code B they
+ *  also control -- or worse, front-run a tier promotion. Binding once, at first
+ *  deposit, means the referrer who brought the position in keeps it. This is the
+ *  same reasoning that made the old `setTraderCode` set-once; we have simply moved
+ *  the binding to the correct object.
+ *
+ *  NFT TRANSFER. The code does NOT move and does NOT reset. Bob referred the
+ *  POSITION; if the position changes hands, the capital Bob introduced is still
+ *  in the vault, so Bob still earns on it. Resetting on transfer would let anyone
+ *  wash the referral off by selling to an alt. Nothing accrues to the buyer's
+ *  referrer, because the buyer never made a referred deposit.
+ *
  *  ─────────────────────────────────────────────────────────────────────────────
  *  WHY THIS SCALES TO MANY (uint64) VAULTS
  *
@@ -71,14 +110,14 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     uint256 public constant RATIO_ONE = 1e18;  // "1.0" and the cap for any ratio
     uint256 public constant RATIO_SQ = 1e36;   // RATIO_ONE * RATIO_ONE
 
-    uint8   public constant MAX_TIERS = 8;     // tiers 1..8
+    uint8 public constant MAX_TIERS = 8;       // tiers 1..8
 
     IERC20 public immutable artha;
 
     /// @notice Config + running books for one vault (across all tiers).
     struct VaultMeta {
-        bool    registered;
-        uint8   decimals;          // base-token decimals (for reference)
+        bool registered;
+        uint8 decimals;            // base-token decimals (for reference)
         uint256 rewardRatio;       // per-vault rate, 0..1e18
         uint256 scale;             // 10^(18 - decimals); raw -> 18dp
         uint256 totalPrincipalRaw; // live referred principal, raw base-token units
@@ -89,7 +128,7 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
 
     /// @notice ARTHA-per-normalised-token accumulator for one (vault, tier).
     struct Lane {
-        bool    init;             // false until first touch (no back-pay before then)
+        bool init;                // false until first touch (no back-pay before then)
         uint256 acc;              // scaled by ACC
         uint256 tierSecondsMark;  // accTierSeconds[tier] snapshot at last advance
     }
@@ -117,6 +156,24 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     mapping(address => mapping(uint8 => Lane)) public lane;
     mapping(address => mapping(uint64 => CodeAccount)) public codeAccount;
 
+    /**
+     * @notice vault => tokenId => the code that referred this position.
+     *
+     *  THE CORE MAPPING OF THE FIX. Bound once on the position's first referred
+     *  deposit; immutable thereafter. Zero means "this position was never
+     *  referred" -- its deposits and withdrawals are no-ops for the referral book.
+     *
+     *  Both notifyDeposit and notifyWithdraw resolve the code from HERE, so they
+     *  can never disagree.
+     */
+    mapping(address => mapping(uint256 => uint64)) public positionCode;
+
+    /// @notice vault => tokenId => live referred principal of that POSITION, 18dp.
+    /// @dev    Σ positionPrincipalNorm[v][id] over a code's positions
+    ///         == codeAccount[v][code].balanceNorm. Enables exact per-position
+    ///         debits and makes the invariant checkable on-chain.
+    mapping(address => mapping(uint256 => uint256)) public positionPrincipalNorm;
+
     // ---- per-code footprint (bounds claimAll / deactivate / pendingAll / syncAll) ----
     mapping(uint64 => address[]) public codeVaults;
     mapping(uint64 => mapping(address => bool)) public codeHasVault;
@@ -129,8 +186,9 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     event RewardRatioUpdated(address indexed vault, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
     event TierRatioUpdated(uint8 indexed tier, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
     event CodeTierChanged(uint64 indexed code, uint8 oldTier, uint8 newTier);
-    event Referred(address indexed vault, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
-    event Unreferred(address indexed vault, uint64 indexed code, uint256 rawPrincipal, uint256 balanceNorm);
+    event PositionBound(address indexed vault, uint256 indexed tokenId, uint64 indexed code);
+    event Referred(address indexed vault, uint64 indexed code, uint256 indexed tokenId, uint256 rawPrincipal, uint256 balanceNorm);
+    event Unreferred(address indexed vault, uint64 indexed code, uint256 indexed tokenId, uint256 rawPrincipal, uint256 balanceNorm);
     event RewardSettled(address indexed vault, uint64 indexed code, uint256 pending);
     event RewardClaimed(address indexed vault, uint64 indexed code, address indexed owner, address to, uint256 amount);
     event Rescued(address indexed token, address to, uint256 amount);
@@ -152,7 +210,10 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
     function _syncTier(uint8 t) internal {
         uint256 nowTs = block.timestamp;
         uint256 last = tierLastUpdate[t];
-        if (last == 0) { tierLastUpdate[t] = nowTs; return; }
+        if (last == 0) {
+            tierLastUpdate[t] = nowTs;
+            return;
+        }
         if (nowTs > last) {
             accTierSeconds[t] += tierRatio[t] * (nowTs - last);
             tierLastUpdate[t] = nowTs;
@@ -222,7 +283,9 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
             totalArthaEarned: 0,
             totalArthaClaimed: 0
         });
-        unchecked { vaultCount += 1; }
+        unchecked {
+            vaultCount += 1;
+        }
         emit VaultRegistered(vault, decimals, scale, rewardRatio_);
     }
 
@@ -287,67 +350,162 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
 
     // ─────────────────────────────── hooks ──────────────────────────────────────
 
-    /// @notice A referred deposit into `vault`. Code read from traderToCode.
-    function notifyDeposit(address vault, address investor, uint256 rawPrincipal)
-        external
-        onlyCaller
-        whenNotPaused
-    {
-        require(vaultMeta[vault].registered, "NOT_REGISTERED");
-        if (rawPrincipal == 0) return;
+    /**
+     * @notice A deposit landed in `tokenId`. Grow the POSITION's referred balance.
+     *
+     *  ┌──────────────────────────────────────────────────────────────────────┐
+     *  │  THE CODE COMES FROM THE POSITION, NOT FROM THE DEPOSITOR.           │
+     *  │                                                                      │
+     *  │  On the FIRST referred deposit we BIND `_code` to the position and   │
+     *  │  it is immutable forever. On every later deposit -- by ANYONE, for   │
+     *  │  ANY reason -- we IGNORE the passed `_code` and use the bound one.   │
+     *  │                                                                      │
+     *  │  That is what kills the phantom. If user-2 (holding Carol's code)    │
+     *  │  gifts capital into user-1's Bob-referred position, the capital      │
+     *  │  joins BOB's balance. Carol gets nothing -- correctly, since she     │
+     *  │  referred nothing. And when the OWNER later withdraws, we debit      │
+     *  │  BOB, the same key we credited. The books close.                     │
+     *  └──────────────────────────────────────────────────────────────────────┘
+     *
+     * @param _vault        The calling vault. MUST equal msg.sender.
+     * @param _tokenId      The position the money went into.
+     * @param _owner        ownerOf(_tokenId) right now. Used for the self-referral
+     *                      check at bind time only.
+     * @param _code         The code to bind, IF this position is not yet bound.
+     *                      Ignored otherwise. Pass 0 for an unreferred deposit.
+     * @param _rawPrincipal NET base token credited (after the vault's entry fee).
+     */
+    function notifyDeposit(
+        address _vault,
+        uint256 _tokenId,
+        address _owner,
+        uint64 _code,
+        uint256 _rawPrincipal
+    ) external onlyCaller(_vault) whenNotPaused {
+        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
+        if (_rawPrincipal == 0) return;
 
-        uint64 code = traderToCode[investor];
-        if (code == uint64(0)) return;
-        address owner = codeOwner[code];
-        if (owner == address(0) || owner == investor) return; // deactivated / self-referral
+        uint64 code = positionCode[_vault][_tokenId];
 
-        _settle(vault, code); // bank at OLD balance
-        uint256 addNorm = rawPrincipal * vaultMeta[vault].scale;
-        CodeAccount storage a = codeAccount[vault][code];
+        // ── first touch: bind the code to the POSITION, once, forever ──
+        if (code == uint64(0)) {
+            if (_code == uint64(0)) return;               // unreferred position
+            address owner = codeOwner[_code];
+            if (owner == address(0)) return;              // code deactivated/nonexistent
+            if (owner == _owner) return;                  // self-referral blocked
+            code = _code;
+            positionCode[_vault][_tokenId] = code;
+            emit PositionBound(_vault, _tokenId, code);
+        }
+        // else: ALREADY BOUND. `_code` is ignored entirely -- the position's code
+        // wins. This is what makes deposit and withdraw agree.
+
+        if (codeOwner[code] == address(0)) return;        // bound code since deactivated
+
+        _settle(_vault, code); // bank at OLD balance
+
+        uint256 addNorm = _rawPrincipal * vaultMeta[_vault].scale;
+        CodeAccount storage a = codeAccount[_vault][code];
         a.balanceNorm += addNorm;
+        positionPrincipalNorm[_vault][_tokenId] += addNorm;
 
-        VaultMeta storage m = vaultMeta[vault];
-        m.totalPrincipalRaw += rawPrincipal;
+        VaultMeta storage m = vaultMeta[_vault];
+        m.totalPrincipalRaw += _rawPrincipal;
         m.totalReferredNorm += addNorm;
 
-        a.rewardDebt = (a.balanceNorm * lane[vault][codeTier[code]].acc) / ACC; // re-checkpoint
+        a.rewardDebt = (a.balanceNorm * lane[_vault][codeTier[code]].acc) / ACC; // re-checkpoint
 
-        if (!codeHasVault[code][vault]) {
-            codeHasVault[code][vault] = true;
-            codeVaults[code].push(vault);
+        if (!codeHasVault[code][_vault]) {
+            codeHasVault[code][_vault] = true;
+            codeVaults[code].push(_vault);
         }
-        emit Referred(vault, code, rawPrincipal, a.balanceNorm);
+        emit Referred(_vault, code, _tokenId, _rawPrincipal, a.balanceNorm);
     }
 
-    /// @notice A referred position in `vault` shrinks or fully exits.
-    function notifyWithdraw(address vault, address investor, uint256 rawPrincipal)
+    /**
+     * @notice Principal left `tokenId`. Shrink the POSITION's referred balance.
+     *
+     *  The code is read from `positionCode[_vault][_tokenId]` -- the SAME source
+     *  notifyDeposit credited. There is no `investor` parameter and no address
+     *  lookup, because the withdrawer's identity is irrelevant: the money left the
+     *  POSITION, so the POSITION's code is debited.
+     *
+     *  The debit is clamped to the position's OWN principal, not the code's total,
+     *  so one position can never eat another position's referred balance even if
+     *  the vault reports a wrong number.
+     *
+     * @param _rawPrincipal The COST BASIS consumed by this withdrawal, raw units.
+     *                      The vault MUST pass basisUsed, NOT the current value --
+     *                      reward principal tracks deposited capital, not value.
+     */
+    function notifyWithdraw(address _vault, uint256 _tokenId, uint256 _rawPrincipal)
         external
-        onlyCaller
+        onlyCaller(_vault)
         whenNotPaused
     {
-        require(vaultMeta[vault].registered, "NOT_REGISTERED");
-        if (rawPrincipal == 0) return;
+        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
+        if (_rawPrincipal == 0) return;
 
-        uint64 code = traderToCode[investor];
-        if (code == uint64(0)) return;
+        uint64 code = positionCode[_vault][_tokenId]; // <- SAME KEY AS DEPOSIT
+        if (code == uint64(0)) return;                // unreferred position
 
-        CodeAccount storage a = codeAccount[vault][code];
+        uint256 posNorm = positionPrincipalNorm[_vault][_tokenId];
+        if (posNorm == 0) return;
+
+        CodeAccount storage a = codeAccount[_vault][code];
         if (a.balanceNorm == 0) return;
 
-        _settle(vault, code); // bank up to now first
+        _settle(_vault, code); // bank up to now first
 
-        uint256 scale = vaultMeta[vault].scale;
-        uint256 decNorm = rawPrincipal * scale;
-        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm; // clamp (defensive)
+        uint256 scale = vaultMeta[_vault].scale;
+        uint256 decNorm = _rawPrincipal * scale;
+
+        // clamp to THIS POSITION's principal -- never another position's
+        if (decNorm > posNorm) decNorm = posNorm;
+        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm; // defensive
+
         uint256 decRaw = decNorm / scale;
+
+        positionPrincipalNorm[_vault][_tokenId] = posNorm - decNorm;
         a.balanceNorm -= decNorm;
 
-        VaultMeta storage m = vaultMeta[vault];
+        VaultMeta storage m = vaultMeta[_vault];
         m.totalReferredNorm -= decNorm;
         m.totalPrincipalRaw = m.totalPrincipalRaw >= decRaw ? m.totalPrincipalRaw - decRaw : 0;
 
-        a.rewardDebt = (a.balanceNorm * lane[vault][codeTier[code]].acc) / ACC;
-        emit Unreferred(vault, code, decRaw, a.balanceNorm);
+        a.rewardDebt = (a.balanceNorm * lane[_vault][codeTier[code]].acc) / ACC;
+        emit Unreferred(_vault, code, _tokenId, decRaw, a.balanceNorm);
+    }
+
+    /**
+     * @notice The position's NFT changed hands.
+     *
+     *  THE CODE DOES NOT MOVE AND DOES NOT RESET. Bob referred the POSITION and the
+     *  capital he introduced is still in the vault, so Bob keeps earning on it.
+     *
+     *  Resetting the code on transfer would be an obvious wash: deposit under no
+     *  code, then transfer to yourself to re-bind under a code you own. Moving it
+     *  to the buyer's referrer would be worse -- it would pay someone who had
+     *  nothing to do with the capital entering the protocol.
+     *
+     *  This hook exists so the vault has ONE uniform integration shape across both
+     *  reward stacks, and so we can settle at the boundary for clean accounting.
+     *  It is a no-op for balances.
+     */
+    function notifyTransfer(address _vault, uint256 _tokenId, address _from, address _to)
+        external
+        onlyCaller(_vault)
+        whenNotPaused
+    {
+        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
+        if (_from == _to) return;
+
+        uint64 code = positionCode[_vault][_tokenId];
+        if (code == uint64(0)) return; // unreferred position: nothing to do
+
+        // Settle at the boundary so `earned` is exact as of the transfer.
+        // Balances are untouched: the code stays bound to the position.
+        _settle(_vault, code);
     }
 
     // ───────────────────────── permissionless sync ──────────────────────────────
@@ -486,6 +644,11 @@ contract ReferralVault is ReferralSystem, ReentrancyGuard {
             m.totalArthaClaimed,
             m.totalArthaEarned - m.totalArthaClaimed
         );
+    }
+
+    /// @notice Live referred principal of one position, in raw base-token units.
+    function positionPrincipalRaw(address vault, uint256 tokenId) external view returns (uint256) {
+        return positionPrincipalNorm[vault][tokenId] / vaultMeta[vault].scale;
     }
 
     function codeVaultsCount(uint64 code) external view returns (uint256) {

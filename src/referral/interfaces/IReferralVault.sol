@@ -14,10 +14,33 @@ import "./IReferralSystem.sol";
  *  is:  (amountNorm * tierRatio[tier] * rewardRatio[vault]) / 1e36 per YEAR,
  *  with YEAR = 360 days and both ratios capped at 1e18.
  *
- *  Caller sites (msg.sender must be an approved caller = the vault / Diamond):
- *     - referred deposit -> notifyDeposit(vault, investor, rawPrincipal)
- *     - referred exit     -> notifyWithdraw(vault, investor, rawPrincipal)
- *  (The code is resolved from the investor's one-time traderToCode.)
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   THE CODE IS BOUND TO THE POSITION, NOT TO AN ADDRESS
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  `positionCode[vault][tokenId]` holds the code that referred a position. It is
+ *  bound ONCE on the position's first referred deposit and is immutable after.
+ *  The Artha vault keeps the code in its own position storage and passes it in.
+ *
+ *  This replaces the old `traderToCode[investor]` lookup, which was broken: anyone
+ *  may deposit into anyone's position but only the OWNER may withdraw, so the two
+ *  hooks resolved DIFFERENT codes and the books could never close. A depositor's
+ *  referrer kept a live referral balance -- and kept earning -- forever after the
+ *  position was emptied and closed.
+ *
+ *      DEPOSIT  credits positionCode[vault][id].
+ *      WITHDRAW debits  positionCode[vault][id].
+ *      SAME KEY. ALWAYS. No phantom balance is possible.
+ *
+ *  Caller sites (msg.sender must be an approved caller AND equal `vault`):
+ *     - referred deposit -> notifyDeposit(vault, tokenId, owner, code, rawPrincipal)
+ *         `code` binds the position on first touch; IGNORED once bound.
+ *         Pass 0 for an unreferred deposit.
+ *     - referred exit    -> notifyWithdraw(vault, tokenId, basisUsed)
+ *         No investor param: the code comes from the position.
+ *         MUST pass basisUsed (cost basis consumed), NOT the current value.
+ *     - NFT transfer     -> notifyTransfer(vault, tokenId, from, to)
+ *         The code does NOT move and does NOT reset. Settles at the boundary.
  *
  *  Anyone may sync()/syncAll() to bank a code's pending into claimable `earned`
  *  without claiming. Ratio changes are non-retroactive and never overpay, so
@@ -72,6 +95,18 @@ interface IReferralVault is IReferralSystem {
             uint256 arthaOutstanding
         );
 
+    // ─────────────────────────── position <-> code binding ──────────────────────
+    /// @notice The code that referred this position. 0 = never referred.
+    ///         Bound once on first referred deposit; immutable thereafter.
+    function positionCode(address vault, uint256 tokenId) external view returns (uint64);
+
+    /// @notice Live referred principal of ONE position, normalised 18dp.
+    /// @dev    Σ over a code's positions == codeAccount[vault][code].balanceNorm.
+    function positionPrincipalNorm(address vault, uint256 tokenId) external view returns (uint256);
+
+    /// @notice Same, in raw base-token units.
+    function positionPrincipalRaw(address vault, uint256 tokenId) external view returns (uint256);
+
     // ─────────────────────────── tier ratio-seconds state ───────────────────────
     function tierRatio(uint8 tier) external view returns (uint256);
     function accTierSeconds(uint8 tier) external view returns (uint256);
@@ -113,8 +148,21 @@ interface IReferralVault is IReferralSystem {
     function setCodeTier(uint64 code, uint8 newTier) external;
 
     // ─────────────────────────── hooks (approved caller) ────────────────────────
-    function notifyDeposit(address vault, address investor, uint256 rawPrincipal) external;
-    function notifyWithdraw(address vault, address investor, uint256 rawPrincipal) external;
+    /// @param code Binds the position on FIRST referred deposit. Ignored once the
+    ///             position is bound. Pass 0 for an unreferred deposit.
+    function notifyDeposit(
+        address vault,
+        uint256 tokenId,
+        address owner,
+        uint64 code,
+        uint256 rawPrincipal
+    ) external;
+
+    /// @param rawPrincipal The COST BASIS consumed -- NOT the current value.
+    function notifyWithdraw(address vault, uint256 tokenId, uint256 rawPrincipal) external;
+
+    /// @notice The code neither moves nor resets; this settles at the boundary.
+    function notifyTransfer(address vault, uint256 tokenId, address from, address to) external;
 
     // ─────────────────────────── permissionless sync ────────────────────────────
     function sync(address vault, uint64 code) external;
