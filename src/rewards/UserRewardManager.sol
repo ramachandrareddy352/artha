@@ -7,13 +7,7 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
  * @title  UserRewardManager
  * @notice Access-control base for the whole USER reward stack. FIRST layer of the chain:
  *
- *             UserRewardManager  <-  UserRewardSystem  <-  UserRewardVault
- *
- *  This mirrors the referral stack exactly:
- *
- *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault
- *
- *  Two reward programmes, one architecture. Learn the shape once, read both.
+ *             UserRewardManager  <-  UserRewardSystem  <-  UserRewardVaul
  *
  *  --------------------------------
  *  WHY A SEPARATE STACK FROM REFERRAL?
@@ -38,9 +32,7 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
  *  (say USDC) can back two vaults running different strategies at different rates.
  *
  *  Reward PRINCIPAL is keyed by (vault, tokenId), because ANYONE may deposit into
- *  someone else's position but only the OWNER may withdraw. See UserRewardSystem
- *  for the full argument -- it is the single most important design note in this
- *  stack.
+ *  someone else's position but only the OWNER may withdraw. 
  *
  *  ROLES
  *   - rewardManager   : the admin. In production this MUST be the Governance
@@ -52,28 +44,25 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
  *                       address, the correct tokenId, and the correct principal.
  */
 contract UserRewardManager is Pausable {
-    // ─────────────────────────── roles ──────────────────────────────────────────
-
+    // ─────────────────────────── roles ─────────────────────────────────────────
     /// @notice The admin address (single source of truth for the whole stack).
     address public rewardManager;
 
-    /// @notice Contracts allowed to call the notify* hooks (the vault layer).
+    /// @notice Contracts allowed to call the notify* hooks (the artha vaults).
     mapping(address => bool) public approvedCallers;
 
     // ─────────────────────────── events ─────────────────────────────────────────
-
     event RewardManagerUpdated(address oldManager, address newManager);
     event CallerUpdated(address caller, bool status);
 
     // ─────────────────────────── modifiers ──────────────────────────────────────
-
     modifier onlyRewardManager() {
         require(msg.sender == rewardManager, "NOT_REWARD_MANAGER");
         _;
     }
 
     /**
-     * @notice Only an approved reporter (only a vault) may drive updates, and ONLY
+     * @notice Only an approved reporter (only a artha vault) may drive updates, and ONLY
      *         under its OWN address.
      *
      *  ┌──────────────────────────────────────────────────────────────────────┐
@@ -109,14 +98,12 @@ contract UserRewardManager is Pausable {
     }
 
     // ─────────────────────────── constructor ────────────────────────────────────
-
     constructor(address _rewardManager) {
         require(_rewardManager != address(0), "INVALID_REWARD_MANAGER");
         rewardManager = _rewardManager;
     }
 
     // ─────────────────────────── admin ──────────────────────────────────────────
-
     function setRewardManager(address _new) external onlyRewardManager {
         require(_new != address(0), "INVALID_REWARD_MANAGER");
         emit RewardManagerUpdated(rewardManager, _new);
