@@ -1,139 +1,107 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./IUserRewardSystem.sol";
+/// @notice Local Chainlink wrapper. Returns USD price at 8 decimals.
+/// @dev Same shape the referral stack uses -- one oracle serves both stacks.
+interface IOracle {
+    function getPrice(address baseAsset) external view returns (uint256);
+}
+
+/// @notice The one view the reward stack needs from an Artha vault.
+interface IArthaVault {
+    /// @notice Price of one share denominated in the base asset, scaled to 1e18.
+    /// @dev MUST be derived from totalAssets()/totalSupply(). If this is ever an
+    ///      admin-written number, whoever holds that key can mint ARTHA at will --
+    ///      the entire reward book is priced off it.
+    function pricePerShare() external view returns (uint256);
+}
 
 /**
- * @title  IUserRewardVault
- * @notice Full external surface of the deployed UserRewardVault (extends the
- *         registry surface). This is the interface the Artha vault layer imports
- *         to drive deposits/withdrawals/transfers, and that users call to claim.
+ * @title IUserRewardVault
+ * @notice Integration surface for the user-staking-reward stack.
  *
- *  KEYED BY (VAULT ADDRESS, POSITION ID). One base token can back several vaults,
- *  each with its own rewardRatio. Reward for a (vault, position) is:
- *      (principalNorm * rewardRatio[vault]) / 1e18 per YEAR,
- *  with YEAR = 360 days and rewardRatio capped at 1e18.
- *
- *  Principal is keyed by POSITION, not by user address, because anyone may
- *  deposit into a position but only the owner may withdraw -- address-keying
- *  would let a withdrawal underflow one balance while leaving phantom principal
- *  on another. ARTHA is credited to the position's OWNER at settle time and
- *  banked into a per-USER balance, so claiming is one transaction.
- *
- *  Caller sites (msg.sender must be an approved caller AND equal `vault`):
- *     - deposit  -> notifyDeposit(vault, tokenId, owner, rawPrincipal)
- *     - withdraw -> notifyWithdraw(vault, tokenId, owner, basisUsed)
- *     - transfer -> notifyTransfer(vault, tokenId, from, to)
- *
- *  Anyone may sync() to bank a position's pending into claimable `earned`
- *  without claiming. Ratio changes are non-retroactive and never overpay, so
- *  correctness does not depend on who (if anyone) calls sync.
+ *  Vault layer:  call notifyShareChange() whenever shares move OUTSIDE stake()/
+ *                unstake() -- transfers, mints, burns. Read getInfo() for display.
+ *  Front-end:    getInfo() / pendingOf() for a position, vaultBooks() for a vault,
+ *                globalBooks() for the programme.
  */
-interface IUserRewardVault is IUserRewardSystem {
-    // ─────────────────────────── constants (getters) ────────────────────────────
-    function ACC() external view returns (uint256);
-    function YEAR() external view returns (uint256);
-    function RATIO_ONE() external view returns (uint256);
-    function artha() external view returns (address);
+interface IUserRewardVault {
+    // ── vault integration ──
 
-    // ─────────────────────────── vault config / books ───────────────────────────
-    /// @return registered         whether the vault is active
-    /// @return decimals           base-token decimals
-    /// @return rewardRatio        per-vault rate (0..1e18). ZERO => no rewards.
-    /// @return scale              10^(18 - decimals)
-    /// @return accArthaPerPrincipal MasterChef accumulator, scaled by ACC
-    /// @return lastUpdate         timestamp the accumulator last advanced
-    /// @return totalPrincipalNorm live principal across all positions, 18dp
-    /// @return totalArthaEarned   cumulative ARTHA credited for this vault
-    /// @return totalArthaClaimed  cumulative ARTHA claimed from this vault
-    function vaultMeta(address vault)
+    /// @notice Report a share movement the vault performed. msg.sender MUST == vault.
+    /// @dev Never reverts on accrual failure; emits SettleFailed instead, so a stale
+    ///      oracle cannot brick the vault's deposit/withdraw path.
+    function notifyShareChange(address vault, address user, uint256 oldShares, uint256 newShares) external;
+
+    /// @notice Everything the front-end needs about one position, in one call.
+    /// @return stakedShares Shares currently staked.
+    /// @return pendingUSD   Settled + unsettled USD, 18dp.
+    /// @return pendingArtha What claiming right now would ACTUALLY pay (cap included).
+    /// @return rateBps      The vault's APR in force now. 1_000 = 1%.
+    /// @return stakedAt     First-ever stake timestamp.
+    function getInfo(address vault, address user)
         external
         view
-        returns (
-            bool registered,
-            uint8 decimals,
-            uint256 rewardRatio,
-            uint256 scale,
-            uint256 accArthaPerPrincipal,
-            uint256 lastUpdate,
-            uint256 totalPrincipalNorm,
-            uint256 totalArthaEarned,
-            uint256 totalArthaClaimed
-        );
+        returns (uint256 stakedShares, uint256 pendingUSD, uint256 pendingArtha, uint256 rateBps, uint256 stakedAt);
 
-    function vaultCount() external view returns (uint64);
+    // ── user ──
 
-    /// @notice Convenience read of a vault's books.
+    function stake(address vault, uint256 amount) external;
+    function unstake(address vault, uint256 amount) external;
+    function settle(address vault, address user) external;
+    function claimArtha(address vault, address to, uint256 amount) external;
+    function claimAll(address to) external;
+
+    // ── views ──
+
+    function artha() external view returns (address);
+    function arthaRemaining() external view returns (uint256);
+    function sharePriceUSD(address vault) external view returns (uint256);
+    function currentRate(address vault) external view returns (uint256);
+    function stakedShares(address vault, address user) external view returns (uint256);
+
+    function pendingOf(address vault, address user)
+        external
+        view
+        returns (uint256 pendingUSD, uint256 pendingArtha);
+
+    function pendingAll(address user)
+        external
+        view
+        returns (address[] memory vaults, uint256[] memory usdAmounts, uint256 totalPendingArtha);
+
     function vaultBooks(address vault)
         external
         view
         returns (
-            uint256 rewardRatio_,
-            uint256 principalNorm,
-            uint256 arthaEarned,
-            uint256 arthaClaimed,
-            uint256 arthaOutstanding
+            address shareToken,
+            uint256 rateBps,
+            uint256 arthaRatio,
+            uint256 stakedShares_,
+            uint256 earnedUSD,
+            uint256 arthaIssued
         );
 
-    // ─────────────────────────── position accounts ──────────────────────────────
-    /// @return balanceNorm live principal for this (vault, tokenId), 18dp
-    /// @return rewardDebt  checkpoint = balanceNorm * acc / ACC at last settle
-    function positionAccount(address vault, uint256 tokenId)
+    function globalBooks()
         external
         view
-        returns (uint256 balanceNorm, uint256 rewardDebt);
+        returns (
+            uint256 arthaMinted,
+            uint256 arthaClaimed,
+            uint256 outstandingArtha,
+            uint256 arthaLeftInBudget,
+            uint256 usdEarned,
+            uint256 usdClaimed
+        );
 
-    function positionPrincipalRaw(address vault, uint256 tokenId) external view returns (uint256);
+    function arthaIssuedPerVault() external view returns (address[] memory vaults, uint256[] memory issued);
 
-    // ─────────────────────────── footprints ─────────────────────────────────────
-    function vaultPositions(address vault, uint256 index) external view returns (uint256);
-    function vaultHasPosition(address vault, uint256 tokenId) external view returns (bool);
-    function vaultPositionsCount(address vault) external view returns (uint256);
+    // ── admin ──
 
-    function userPositions(address user, uint256 index) external view returns (address vault, uint256 tokenId);
-    function userHasPosition(address user, address vault, uint256 tokenId) external view returns (bool);
-    function userPositionsCount(address user) external view returns (uint256);
-    function userPositionAt(address user, uint256 index) external view returns (address vault, uint256 tokenId);
-
-    // ─────────────────────────── user ledgers ───────────────────────────────────
-    function totalEarned(address user) external view returns (uint256);
-    function claimed(address user) external view returns (uint256);
-    function earnedByVault(address vault, address user) external view returns (uint256);
-    function earnedByPosition(address vault, uint256 tokenId) external view returns (uint256);
-
-    // ─────────────────────────── pool-wide totals ───────────────────────────────
-    function maxDistributable() external view returns (uint256);
-    function totalDistributed() external view returns (uint256);
-    function totalClaimed() external view returns (uint256);
-    function remainingPool() external view returns (uint256);
-    function outstandingLiability() external view returns (uint256);
-    function isSolvent() external view returns (bool);
-
-    // ─────────────────────────── configuration (governance) ─────────────────────
-    function registerVault(address vault, uint8 decimals, uint256 rewardRatio_) external;
-    function setRewardRatio(address vault, uint256 newRatio) external;
-    function stopAll(address[] calldata vaults) external;
-    function setCap(uint256 cap) external;
-
-    // ─────────────────────────── hooks (approved caller) ────────────────────────
-    function notifyDeposit(address vault, uint256 tokenId, address owner, uint256 rawPrincipal) external;
-    function notifyWithdraw(address vault, uint256 tokenId, address owner, uint256 rawPrincipal) external;
-    function notifyTransfer(address vault, uint256 tokenId, address from, address to) external;
-
-    // ─────────────────────────── permissionless sync ────────────────────────────
-    function sync(address vault, uint256 tokenId, address owner) external;
-    function syncAllPositions(address vault, address[] calldata owners) external;
-
-    // ─────────────────────────── claims ─────────────────────────────────────────
-    function claim(address to, uint256 amount) external;
-    function claimAll(address to) external returns (uint256 amount);
-    function claimable(address user) external view returns (uint256);
-    function claimableBanked(address user) external view returns (uint256);
-
-    // ─────────────────────────── admin ──────────────────────────────────────────
+    function registerVault(address vault, address shareToken, uint8 decimals, uint256 rateBps, uint256 arthaRatio)
+        external;
+    function setRewardRate(address vault, uint256 rateBps) external;
+    function setArthaRatio(address vault, uint256 arthaRatio) external;
+    function setOracle(address newOracle) external;
     function rescue(address token, address to, uint256 amount) external;
-
-    // ─────────────────────────── views ──────────────────────────────────────────
-    function pendingReward(address vault, uint256 tokenId) external view returns (uint256);
-    function pendingRewardAll(address user) external view returns (uint256);
 }

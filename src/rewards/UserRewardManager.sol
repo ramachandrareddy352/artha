@@ -5,90 +5,56 @@ import "openzeppelin-contracts/contracts/utils/Pausable.sol";
 
 /**
  * @title  UserRewardManager
- * @notice Access-control base for the whole USER reward stack. FIRST layer of the chain:
+ * @notice Access-control base for the whole user-staking-reward stack. FIRST layer:
  *
- *             UserRewardManager  <-  UserRewardSystem  <-  UserRewardVaul
+ *             UserRewardManager  <-  UserRewardSystem  <-  UserRewardVault
  *
- *  --------------------------------
- *  WHY A SEPARATE STACK FROM REFERRAL?
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   WHAT THIS STACK IS
+ *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  They pay DIFFERENT people for DIFFERENT things out of DIFFERENT pools:
+ *  Artha is a set of single-asset VAULTS (a USDC vault, a DAI vault, a WETH vault,
+ *  ...), exactly like Yearn. Each vault is its own ERC-4626 and deploys its one base
+ *  token into STRATEGIES. Holding shares earns yield; that is the vault's job and
+ *  this stack does not touch it.
  *
- *    - REFERRAL rewards pay the CODE OWNER for bringing capital in.
- *      Keyed by (vault, code). Has tiers. Temporary programme.
+ *  This stack is the SECOND, separate incentive: STAKE your vault shares here and
+ *  earn ARTHA on top, priced on the USD value of what you staked, accruing per
+ *  second. Shares that merely sit in a wallet earn nothing -- the user must stake.
  *
- *    - USER rewards pay the POSITION for having capital at risk.
- *      Keyed by (vault, tokenId). No tiers. Permanent programme.
- *
- *  Separate stacks mean separate ARTHA pools and separate caps. Draining one
- *  can never touch the other. That isolation is the entire point.
- *
- *  --------------------------------
- *  KEYED BY (VAULT ADDRESS, POSITION ID) -- NOT BY USER ADDRESS.
- *
- *  Artha is a set of single-asset VAULTS (a USDC vault, a WETH vault, ...).
- *  Each vault is its own ERC-721 and mints POSITIONS (tokenIds). Reward rates are
- *  keyed by the VAULT CONTRACT ADDRESS, never by token type -- one base token
- *  (say USDC) can back two vaults running different strategies at different rates.
- *
- *  Reward PRINCIPAL is keyed by (vault, tokenId), because ANYONE may deposit into
- *  someone else's position but only the OWNER may withdraw. 
+ *  This is the sibling of the REFERRAL stack, and the two are deliberately opposite
+ *  in one respect. Referral commission is priced PER FEE, at call time, and banked
+ *  instantly -- nothing accrues, so a tier change needs no settlement dance. User
+ *  staking rewards ACCRUE OVER TIME, so every rate change and every share movement
+ *  must settle first. That single difference drives most of the design in layer 2.
  *
  *  ROLES
- *   - rewardManager   : the admin. In production this MUST be the Governance
- *                       Timelock. It registers vaults, sets per-vault reward
- *                       ratios, sets the cap, rescues funds, pauses.
- *   - approvedCallers : contracts allowed to report principal changes through the
- *                       notify* hooks. This is the Artha vault layer (each vault
- *                       Diamond). They are trusted to pass the correct `vault`
- *                       address, the correct tokenId, and the correct principal.
+ *   - userRewardManager : the admin. In production this MUST be the Governance
+ *                         Timelock. It registers vaults, sets per-vault reward rates
+ *                         and ARTHA ratios, sets the oracle, rescues funds, pauses.
+ *   - approvedCallers   : contracts allowed to report share movements through
+ *                         notifyShareChange(). This is the Artha vault layer (each
+ *                         vault Diamond). They are trusted to pass the correct
+ *                         `vault` address, `user`, and share amounts.
  */
 contract UserRewardManager is Pausable {
-    // ─────────────────────────── roles ─────────────────────────────────────────
-    /// @notice The admin address (single source of truth for the whole stack).
-    address public rewardManager;
+    /// @notice The admin address (single source of truth for the whole stack[Governance Timelock]).
+    address public userRewardManager;
 
-    /// @notice Contracts allowed to call the notify* hooks (the artha vaults).
+    /// @notice Contracts allowed to report share movements (the vault layer).
     mapping(address => bool) public approvedCallers;
 
-    // ─────────────────────────── events ─────────────────────────────────────────
-    event RewardManagerUpdated(address oldManager, address newManager);
+    event UserRewardManagerUpdated(address oldManager, address newManager);
     event CallerUpdated(address caller, bool status);
 
-    // ─────────────────────────── modifiers ──────────────────────────────────────
-    modifier onlyRewardManager() {
-        require(msg.sender == rewardManager, "NOT_REWARD_MANAGER");
+    modifier onlyUserRewardManager() {
+        require(msg.sender == userRewardManager, "NOT_USER_REWARD_MANAGER");
         _;
     }
 
     /**
-     * @notice Only an approved reporter (only a artha vault) may drive updates, and ONLY
-     *         under its OWN address.
-     *
-     *  ┌──────────────────────────────────────────────────────────────────────┐
-     *  │  THE `msg.sender == vault` CHECK IS NOT OPTIONAL.                    │
-     *  │                                                                      │
-     *  │  Without it, ANY approved vault can credit rewards under ANY OTHER   │
-     *  │  vault's key. Concretely:                                            │
-     *  │                                                                      │
-     *  │   1. WETH-Vault is an approved caller (legitimately).                │
-     *  │   2. WETH-Vault rewardRatio = 1e17  (10%/yr -- low).                 │
-     *  │   3. USDC-Vault rewardRatio = 1e18  (100%/yr -- launch boost).       │
-     *  │   4. A bug or malicious upgrade in WETH-Vault lets it call:          │
-     *  │        system.notifyDeposit(USDC_VAULT, someId, 1e30)                │
-     *  │                             ^^^^^^^^^^ not its own address!          │
-     *  │   5. Phantom principal now accrues at 100%/yr in a vault that never  │
-     *  │      received a cent. The entire ARTHA pool drains.                  │
-     *  │                                                                      │
-     *  │  WITH the check: a compromised vault can only corrupt its OWN book.  │
-     *  │  Blast radius = one vault. That is the difference between a bug and  │
-     *  │  a catastrophe.                                                      │
-     *  └──────────────────────────────────────────────────────────────────────┘
-     *
-     *  NOTE: `ReferralVaultManager.onlyCaller` in the referral stack currently
-     *  takes NO argument and therefore CANNOT make this check. It is vulnerable
-     *  to exactly the attack above. It should be changed to match this signature.
-     *
+     * @notice Only an approved reporter (only a vault) may drive settlement, and
+     *         ONLY under its OWN address.
      * @param _vault The vault the caller claims to be reporting for.
      */
     modifier onlyCaller(address _vault) {
@@ -97,31 +63,29 @@ contract UserRewardManager is Pausable {
         _;
     }
 
-    // ─────────────────────────── constructor ────────────────────────────────────
-    constructor(address _rewardManager) {
-        require(_rewardManager != address(0), "INVALID_REWARD_MANAGER");
-        rewardManager = _rewardManager;
+    constructor(address _userRewardManager) {
+        require(_userRewardManager != address(0), "INVALID_USER_REWARD_MANAGER");
+        userRewardManager = _userRewardManager;
     }
 
-    // ─────────────────────────── admin ──────────────────────────────────────────
-    function setRewardManager(address _new) external onlyRewardManager {
-        require(_new != address(0), "INVALID_REWARD_MANAGER");
-        emit RewardManagerUpdated(rewardManager, _new);
-        rewardManager = _new;
+    function setUserRewardManager(address _new) external onlyUserRewardManager {
+        require(_new != address(0), "INVALID_USER_REWARD_MANAGER");
+        emit UserRewardManagerUpdated(userRewardManager, _new);
+        userRewardManager = _new;
     }
 
-    /// @notice Approve/revoke a contract (a vault Diamond) for the notify* hooks.
-    function setCaller(address _caller, bool _status) external onlyRewardManager {
+    /// @notice Approve/revoke a contract (a vault / the Diamond) for share reporting.
+    function setCaller(address _caller, bool _status) external onlyUserRewardManager {
         require(_caller != address(0), "INVALID_CALLER");
         approvedCallers[_caller] = _status;
         emit CallerUpdated(_caller, _status);
     }
 
-    function pause() external onlyRewardManager {
+    function pause() external onlyUserRewardManager {
         _pause();
     }
 
-    function unpause() external onlyRewardManager {
+    function unpause() external onlyUserRewardManager {
         _unpause();
     }
 }
