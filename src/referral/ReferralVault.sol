@@ -5,666 +5,856 @@ import "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import "openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
 
 import "./ReferralSystem.sol";
+import "./interfaces/IReferralVault.sol";
 
 /**
  * @title  ReferralVault
- * @notice Holds ARTHA and pays code OWNERS on: HOW MUCH referred capital, HOW LONG
- *         it stays, WHICH vault it sits in, and WHICH tier the code is on.
+ * @notice Splits a vault's PERFORMANCE FEE between the protocol and the referrer,
+ *         rebates part of the referrer's cut to the trader, and credits ARTHA on
+ *         top -- all in ONE call, at the moment the fee is charged.
  *
  *             ReferralVaultManager  <-  ReferralSystem  <-  ReferralVault (deployed)
  *
- *  ─────────────────────────────────────────────────────────────────────────────
- *  REWARD FORMULA
- *      rewardPerYear = (amountNorm * tierRatio * rewardRatio) / 1e36     [ARTHA/yr]
- *      accrued       = rewardPerYear * elapsed / YEAR                   [ARTHA]
- *    amountNorm  = raw principal * 10^(18-decimals)   (USDC*1e12, DAI/WETH*1)
- *    rewardRatio = per-VAULT rate, 0..1e18       (USDC 1e18, WETH 5e17, ...)
- *    tierRatio   = per-TIER rate, 0..1e18       (tier1 1e17, tier2 3e17, tier3 1e18)
- *    YEAR        = 360 days  (protocol convention)
- *    Both ratios cap at 1e18 -> max reward = 100% of principal per year.
- *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   THE CODE IS BOUND TO THE POSITION, NOT TO AN ADDRESS
+ *   THE SPLIT
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  `positionCode[vault][tokenId]` is the code that referred a given position. It
- *  is bound ONCE, on that position's first referred deposit, and is immutable for
- *  the life of the position. The Artha vault stores the code in its own position
- *  storage and passes it in on every hook.
+ *  A trader deposits 1,000 USDC and withdraws with 100 USDC of profit. The vault's
+ *  performance fee is 10%, so 10 USDC is charged. That 10 USDC -- and ONLY that 10
+ *  USDC -- is what the referral programme touches. Principal is never at risk and
+ *  the trader's 90 USDC of profit is never reduced.
  *
- *  This replaces the old `traderToCode[investor]` lookup, which was BROKEN because
- *  anyone may deposit into anyone's position but only the OWNER may withdraw --
- *  so the deposit hook and the withdraw hook resolved DIFFERENT codes, and the
- *  books could never close. A depositor's code kept a referral balance alive
- *  forever after the position was emptied and closed. See ReferralSystem's
- *  contract-level comment for the full walkthrough of that failure.
+ *      performanceFee = 10 USDC                        (charged by the vault)
  *
- *      ┌────────────────────────────────────────────────────────────┐
- *      │  DEPOSIT  credits positionCode[vault][id].                 │
- *      │  WITHDRAW debits  positionCode[vault][id].                 │
- *      │  SAME KEY. ALWAYS.                                         │
- *      │                                                            │
- *      │  balanceNorm[code] is therefore the exact sum of the live  │
- *      │  principal of every position bound to that code. It cannot │
- *      │  be stranded and cannot underflow.                        │
- *      └────────────────────────────────────────────────────────────┘
+ *      ownerGross     = fee * tierRewardRatio[V][t] / RATIO_ONE
+ *                     = 10 * 20_000 / 100_000  =  2 USDC        (tier-2, 20%)
+ *      protocol       = fee - ownerGross        =  8 USDC
  *
- *  WHY IMMUTABLE ONCE BOUND. If a position could re-bind to a new code, a user
- *  could park capital under code A for a year, then re-point it at code B they
- *  also control -- or worse, front-run a tier promotion. Binding once, at first
- *  deposit, means the referrer who brought the position in keeps it. This is the
- *  same reasoning that made the old `setTraderCode` set-once; we have simply moved
- *  the binding to the correct object.
+ *      discount       = ownerGross * codeDiscount[c] / RATIO_ONE
+ *                     = 2 * 10_000 / 100_000   =  0.2 USDC      (10% rebate)
+ *      ownerNet       = ownerGross - discount   =  1.8 USDC
  *
- *  NFT TRANSFER. The code does NOT move and does NOT reset. Bob referred the
- *  POSITION; if the position changes hands, the capital Bob introduced is still
- *  in the vault, so Bob still earns on it. Resetting on transfer would let anyone
- *  wash the referral off by selling to an alt. Nothing accrues to the buyer's
- *  referrer, because the buyer never made a referred deposit.
+ *  With NO referral (trader never bound a code, or bound one that is now dead),
+ *  ownerGross is zero and the protocol keeps the ENTIRE 10 USDC. The referral
+ *  contract is never called and never holds a cent.
  *
- *  ─────────────────────────────────────────────────────────────────────────────
- *  WHY THIS SCALES TO MANY (uint64) VAULTS
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   ARTHA IS PRICED ON THE GROSS, NOT THE NET
+ *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  The rate for a (vault V, tier t) position is rewardRatio[V]*tierRatio[t] — a
- *  PRODUCT of two independently-governed rates. A naive per-(V,t) accumulator would
- *  have to be advanced for EVERY vault whenever a tier ratio changes (fan-out
- *  over vaults) — impossible at uint64 scale. So we SPLIT it:
+ *  ARTHA is credited on `ownerGross` (2 USDC), NOT on `ownerNet` (1.8 USDC). If it
+ *  were priced on the net, generosity would be punished twice -- an owner who
+ *  rebates 50% to win traders would lose half his ARTHA as well, so every rational
+ *  owner would set discount = 0 and the lever would be dead on arrival. Pricing on
+ *  the gross makes the discount a pure choice about base tokens: rebate as hard as
+ *  you like, your ARTHA is untouched.
  *
- *    • accTierSeconds[t] = ∫ tierRatio[t](τ) dτ          (one integral per tier)
- *        A tier-ratio change advances THIS integral only — O(1), no vault touch.
- *        It literally stores "old ratio up to the change timestamp, new after":
- *        tierLastUpdate[t] is the boundary; the integral banks the old ratio up to
- *        it; everything after uses the new ratio.
+ *  CONVERSION.  gross (raw, 6..18dp)
+ *                 -> norm18   = gross * scale                   [18dp]
+ *                 -> usd18    = norm18 * price / 1e8            [18dp USD]
+ *                 -> artha    = usd18 * arthaRatio[V] / 1e18    [18dp ARTHA]
  *
- *    • lane[V][t].acc    = ARTHA per normalised token for that (V,t) pair
- *        acc += rewardRatio[V] * Δ(accTierSeconds[t]) * ACC / (1e36 * YEAR)
- *        Valid because rewardRatio[V] is held CONSTANT across the window: a
- *        reward-ratio change advances every registered tier lane of V FIRST
- *        (fan-out over TIERS ≤ 8 — trivial), then writes the new ratio.
+ *  `arthaRatio[V]` is "ARTHA per 1 USD of commission", 18dp, per VAULT:
+ *      USDC vault => 1e18  -> 2 USDC of commission = 2 USD  ->  2 ARTHA
+ *      WETH vault => 1e19  -> 2 USD of WETH commission      -> 20 ARTHA
+ *  Same dollar, different reward -- the knob that makes thin/strategic vaults worth
+ *  referring into. The oracle returns USD in 8dp, so a $3,000 WETH price is 3000e8.
  *
- *  Cost:  tier ratio change O(1);  vault ratio change O(#tiers ≤ 8);
- *         code promotion O(#vaults-the-code-uses).  No loop over the global
- *         vault set anywhere -> vaults may number up to type(uint64).max.
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   THE GLOBAL ARTHA CAP IS A HARD CEILING, AND IT PAYS PARTIAL
+ *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  ZERO RETROACTIVITY & PERMISSIONLESS SYNC
- *    Every ratio change banks the old rate at the change instant, so late settlers
- *    get the old rate up to the change and the new rate after — never the new rate
- *    on old time. If a code owner does not settle, ANYONE may call sync()/syncAll()
- *    to convert that code's PENDING into CLAIMABLE `earned` WITHOUT claiming.
+ *  MAX_ARTHA (10,000,000e18) is the programme's entire lifetime budget. When a
+ *  credit would cross it we grant EXACTLY the remainder and book that -- never the
+ *  full ask, never zero:
  *
- *  DOUBLE-SYNC SAFETY
- *    _settle() sets rewardDebt = accumulated AFTER banking; an immediate second
- *    settle computes pending = accumulated - rewardDebt = 0. No path pays twice.
+ *      minted = 9,999,999e18,  request = 5e18
+ *        -> remaining = 1e18 -> grant 1e18, totalArthaMinted = MAX_ARTHA. Done.
  *
- *  PER-VAULT BOOKS: live referred principal (raw + normalised) and cumulative
- *  ARTHA earned/claimed, per vault — see VaultMeta and vaultBooks().
+ *  Granting the full ask would let the last settler mint past the cap and leave the
+ *  contract insolvent against `totalEarnedArtha`. Granting zero would silently burn
+ *  a real, earned claim at the boundary. Partial is the only honest answer, and it
+ *  is why `_creditArtha` returns the GRANTED amount and every caller books THAT --
+ *  the books track what was actually credited, so the solvency check in rescue()
+ *  stays exact right up to the final wei.
  *
- *  FUNDING: does NOT mint. Fund with ARTHA up front; claims pay from balance.
+ *  Crossing the cap NEVER reverts a withdraw. The base-token commission is a real
+ *  contractual obligation; the ARTHA bonus is a budgeted incentive. A depleted
+ *  budget must not brick the vault's withdraw path -- so ARTHA simply goes to zero
+ *  and base keeps flowing.
+ *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   INTEGRATION
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  Inside the vault's withdraw path, once the performance fee is known:
+ *
+ *      (, uint256 ownerNet, uint256 discount, , ,) =
+ *          referralVault.getInfo(address(this), trader, perfFee);
+ *
+ *      if (ownerNet + discount != 0) {
+ *          base.forceApprove(address(referralVault), ownerNet + discount);
+ *          referralVault.settlePerformanceFee(address(this), trader, perfFee);
+ *      }
+ *      // the vault retains `protocolAmount` = perfFee - ownerGross.
+ *
+ *  settlePerformanceFee PULLS `ownerNet + discount` via transferFrom and forwards
+ *  the discount to the trader in the same transaction. It recomputes the identical
+ *  split internally through the SAME `_split` helper getInfo uses, so the view and
+ *  the state change can never disagree -- there is one formula, in one place, and
+ *  both paths call it.
+ *
+ *  FUNDING: this contract does NOT mint ARTHA. Fund it up front; claims pay from
+ *  balance. Base tokens are pulled per-settlement, so no base float is held beyond
+ *  what is owed.
  */
 contract ReferralVault is ReferralSystem, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // ---- fixed-point constants ----
-    uint256 public constant ACC = 1e18;        // accumulator precision
-    uint256 public constant YEAR = 360 days;   // 360-day year (protocol convention)
-    uint256 public constant RATIO_ONE = 1e18;  // "1.0" and the cap for any ratio
-    uint256 public constant RATIO_SQ = 1e36;   // RATIO_ONE * RATIO_ONE
+    // ─────────────────────────────── constants ──────────────────────────────────
 
-    uint8 public constant MAX_TIERS = 8;       // tiers 1..8
+    /// @notice Lifetime ARTHA budget for the entire referral programme.
+    uint256 public constant MAX_ARTHA = 10_000_000e18;
 
-    IERC20 public immutable artha;
+    /// @dev Oracle prices are 8dp; ARTHA and the normalised base are 18dp.
+    uint256 private constant PRICE_ONE = 1e8;
+    uint256 private constant WAD = 1e18;
 
-    /// @notice Config + running books for one vault (across all tiers).
-    struct VaultMeta {
-        bool registered;
-        uint8 decimals;            // base-token decimals (for reference)
-        uint256 rewardRatio;       // per-vault rate, 0..1e18
-        uint256 scale;             // 10^(18 - decimals); raw -> 18dp
-        uint256 totalPrincipalRaw; // live referred principal, raw base-token units
-        uint256 totalReferredNorm; // live referred principal, normalised 18dp
-        uint256 totalArthaEarned;  // cumulative ARTHA credited for this vault
-        uint256 totalArthaClaimed; // cumulative ARTHA claimed from this vault
+    IERC20 public immutable arthaToken;
+
+    // ─────────────────────────────── types ──────────────────────────────────────
+
+    /// @notice Config + lifetime books for one registered vault.
+    struct VaultData {
+        bool registered;             // if not active set to false again, and the vault is ignored
+        address baseAsset;           // the vault's single base token
+        uint256 scale;               // 10^(18 - decimals); raw -> 18dp
+        uint256 arthaRatio;          // ARTHA (18dp) per 1 USD of commission
+        uint256 totalCommissionBase; // lifetime base paid as referral commission (gross)
+        uint256 totalDiscountBase;   // lifetime base rebated to traders
+        uint256 totalProtocolBase;   // lifetime base retained by the protocol
+        uint256 totalArthaEarned;    // lifetime ARTHA credited from this vault
     }
 
-    /// @notice ARTHA-per-normalised-token accumulator for one (vault, tier).
-    struct Lane {
-        bool init;                // false until first touch (no back-pay before then)
-        uint256 acc;              // scaled by ACC
-        uint256 tierSecondsMark;  // accTierSeconds[tier] snapshot at last advance
+    /// @notice Per (code, vault) earnings ledger for the code OWNER.
+    struct Earning {
+        uint256 totalEarnedBase;  // lifetime base commission, net of discount
+        uint256 claimedBase;      // lifetime base claimed
+        uint256 totalEarnedArtha; // lifetime ARTHA credited
+        uint256 claimedArtha;     // lifetime ARTHA claimed
     }
 
-    /// @notice Per (vault, code) account.
-    struct CodeAccount {
-        uint256 balanceNorm; // live referred principal, 18dp
-        uint256 rewardDebt;  // balanceNorm * lane.acc / ACC at last settle
-        uint256 earned;      // settled, claimable ARTHA
-        uint256 claimed;     // lifetime claimed ARTHA (tracking)
+    /// @notice Per (code, vault) trader-side rebate ledger.
+    struct UserData {
+        uint256 totalDiscountBase; // lifetime base rebated to traders under this code
+        uint256 totalVolumeBase;   // lifetime gross commission generated under this code
     }
-
-    // ---- vault config / books ----
-    mapping(address => VaultMeta) public vaultMeta;
-    uint64 public vaultCount; // registered vaults (uint64 space)
-
-    // ---- tiers: global ratio-seconds integrals ----
-    mapping(uint8 => uint256) public tierRatio;      // tier => ratio 0..1e18
-    mapping(uint8 => uint256) public accTierSeconds; // tier => ∫ tierRatio dτ
-    mapping(uint8 => uint256) public tierLastUpdate; // tier => last advance ts (change boundary)
-    uint8[] public registeredTiers;                  // ≤ MAX_TIERS
-    mapping(uint8 => bool) private _tierKnown;
-
-    // ---- per-(vault,tier) lanes and per-(vault,code) accounts ----
-    mapping(address => mapping(uint8 => Lane)) public lane;
-    mapping(address => mapping(uint64 => CodeAccount)) public codeAccount;
 
     /**
-     * @notice vault => tokenId => the code that referred this position.
-     *
-     *  THE CORE MAPPING OF THE FIX. Bound once on the position's first referred
-     *  deposit; immutable thereafter. Zero means "this position was never
-     *  referred" -- its deposits and withdrawals are no-ops for the referral book.
-     *
-     *  Both notifyDeposit and notifyWithdraw resolve the code from HERE, so they
-     *  can never disagree.
+     * @notice One priced performance fee. Carried in MEMORY, not on the stack.
+     * @dev    The split has five outputs plus the resolved code, and settlement
+     *         needs all six alive at once alongside the token handles and storage
+     *         pointers -- which overflows the EVM's 16-slot reachable stack. Bundling
+     *         them into one memory struct is a structural fix, so the contract
+     *         compiles WITHOUT `--via-ir` and integrators are not forced onto it.
      */
-    mapping(address => mapping(uint256 => uint64)) public positionCode;
+    struct Split {
+        uint64 code;             // resolved active code (0 => unreferred)
+        uint256 ownerGross;      // referrer's cut of the fee, BEFORE discount
+        uint256 ownerNet;        // what the referrer banks (gross - discount)
+        uint256 discountAmount;  // rebated to the trader
+        uint256 protocolAmount;  // retained by the vault (fee - ownerGross)
+        uint256 arthaAmount;     // ARTHA priced on ownerGross, capped by budget
+    }
 
-    /// @notice vault => tokenId => live referred principal of that POSITION, 18dp.
-    /// @dev    Σ positionPrincipalNorm[v][id] over a code's positions
-    ///         == codeAccount[v][code].balanceNorm. Enables exact per-position
-    ///         debits and makes the invariant checkable on-chain.
-    mapping(address => mapping(uint256 => uint256)) public positionPrincipalNorm;
+    // ─────────────────────────────── events ─────────────────────────────────────
 
-    // ---- per-code footprint (bounds claimAll / deactivate / pendingAll / syncAll) ----
+    event VaultRegistered(address indexed vault, address indexed baseAsset, uint256 arthaRatio);
+    event ArthaRatioUpdated(address indexed vault, uint256 oldRatio, uint256 newRatio);
+    event TierRewardRatioUpdated(address indexed vault, uint8 indexed tier, uint256 oldRatio, uint256 newRatio);
+    event OracleUpdated(address oldOracle, address newOracle);
+    event CommissionSettled(
+        address indexed vault,
+        uint64 indexed code,
+        address indexed trader,
+        uint256 performanceFee,
+        uint256 ownerGross,
+        uint256 ownerNet,
+        uint256 discountAmount,
+        uint256 protocolAmount,
+        uint256 arthaAmount
+    );
+    event BaseClaimed(address indexed vault, uint64 indexed code, address indexed to, uint256 amount);
+    event ArthaClaimed(address indexed vault, uint64 indexed code, address indexed to, uint256 amount);
+    event ArthaCapReached(uint256 requested, uint256 granted, uint256 totalMinted);
+    event Rescued(address indexed token, address indexed to, uint256 amount);
+
+    // ─────────────────────────────── storage ────────────────────────────────────
+
+    IOracle public oracle;
+
+    /// @notice Lifetime ARTHA credited across all vaults. Never exceeds MAX_ARTHA.
+    uint256 public totalArthaMinted;
+
+    /// @notice Lifetime base commission credited (net of discount), all vaults.
+    uint256 public totalEarnedBase;
+    /// @notice Lifetime base commission claimed, all vaults.
+    uint256 public totalClaimedBase;
+    /// @notice Lifetime ARTHA claimed, all vaults.
+    uint256 public totalClaimedArtha;
+
+    /// @notice vault => config + lifetime books.
+    mapping(address => VaultData) private _vaultData;
+
+    /// @notice vault => tier => the referrer's share of the performance fee.
+    ///         1_000 = 1%, 100_000 = 100%. Set per vault: a deep, high-margin vault
+    ///         can afford a bigger profit share than a thin one.
+    mapping(address => mapping(uint8 => uint256)) public tierRewardRatio;
+
+    /// @notice vault => code => the owner's earnings ledger.
+    mapping(address => mapping(uint64 => Earning)) private _earning;
+
+    /// @notice vault => code => the trader-side rebate ledger.
+    mapping(address => mapping(uint64 => UserData)) private _userData;
+
+    /// @notice vault => lifetime base claimed out of that vault's book. Tracked
+    ///         incrementally so rescue() can bound itself without walking every code.
+    mapping(address => uint256) public vaultClaimedBase;
+
+    // ---- per-code footprint (bounds claimAll / deactivateCode) ----
     mapping(uint64 => address[]) public codeVaults;
     mapping(uint64 => mapping(address => bool)) public codeHasVault;
 
-    // ---- vault-wide totals (rescue safety) ----
-    uint256 public totalEarnedArtha;
-    uint256 public totalClaimedArtha;
+    // ---- registered vault set ----
+    address[] public registeredVaults;
 
-    event VaultRegistered(address indexed vault, uint8 decimals, uint256 scale, uint256 rewardRatio);
-    event RewardRatioUpdated(address indexed vault, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
-    event TierRatioUpdated(uint8 indexed tier, uint256 oldRatio, uint256 newRatio, uint256 atTimestamp);
-    event CodeTierChanged(uint64 indexed code, uint8 oldTier, uint8 newTier);
-    event PositionBound(address indexed vault, uint256 indexed tokenId, uint64 indexed code);
-    event Referred(address indexed vault, uint64 indexed code, uint256 indexed tokenId, uint256 rawPrincipal, uint256 balanceNorm);
-    event Unreferred(address indexed vault, uint64 indexed code, uint256 indexed tokenId, uint256 rawPrincipal, uint256 balanceNorm);
-    event RewardSettled(address indexed vault, uint64 indexed code, uint256 pending);
-    event RewardClaimed(address indexed vault, uint64 indexed code, address indexed owner, address to, uint256 amount);
-    event Rescued(address indexed token, address to, uint256 amount);
-
-    constructor(address _artha, address _admin) ReferralSystem(_admin) {
+    constructor(address _artha, address _oracle, address _admin) ReferralSystem(_admin) {
         require(_artha != address(0), "INVALID_ARTHA");
-        artha = IERC20(_artha);
-
-        // default tiers (governance may change any ratio and add tiers up to 8)
-        _initTier(1, 1e17); // 0.1
-        _initTier(2, 3e17); // 0.3
-        _initTier(3, 1e18); // 1.0
+        require(_oracle != address(0), "INVALID_ORACLE");
+        arthaToken = IERC20(_artha);
+        oracle = IOracle(_oracle);
     }
 
-    // ─────────────────────── tier ratio-seconds integral ─────────────────────────
-
-    /// @dev Advance accTierSeconds[t] to now using CURRENT tierRatio[t]. Storing the
-    ///      integral IS storing "old ratio up to tierLastUpdate, new after".
-    function _syncTier(uint8 t) internal {
-        uint256 nowTs = block.timestamp;
-        uint256 last = tierLastUpdate[t];
-        if (last == 0) {
-            tierLastUpdate[t] = nowTs;
-            return;
-        }
-        if (nowTs > last) {
-            accTierSeconds[t] += tierRatio[t] * (nowTs - last);
-            tierLastUpdate[t] = nowTs;
-        }
+    function artha() external view returns (address) {
+        return address(arthaToken);
     }
 
-    // ─────────────────────────── lane accrual core ──────────────────────────────
-
-    /// @dev Advance one (vault, tier) lane. rewardRatio[V] is constant across the
-    ///      window (setRewardRatio advances every tier lane of V before changing it).
-    function _updateLane(address vault, uint8 tier) internal {
-        _syncTier(tier);
-        Lane storage L = lane[vault][tier];
-        if (!L.init) {
-            L.init = true;
-            L.tierSecondsMark = accTierSeconds[tier];
-            return;
-        }
-        uint256 dts = accTierSeconds[tier] - L.tierSecondsMark;
-        if (dts != 0) {
-            uint256 rr = vaultMeta[vault].rewardRatio;
-            if (rr != 0) {
-                L.acc += (rr * dts * ACC) / (RATIO_SQ * YEAR);
-            }
-            L.tierSecondsMark = accTierSeconds[tier];
-        }
-    }
-
-    /// @dev Bank a code's accrued reward in one vault into `earned`, then refresh
-    ///      its checkpoint. Idempotent within a block (double-settle banks nothing).
-    function _settle(address vault, uint64 code) internal {
-        uint8 tier = codeTier[code];
-        _updateLane(vault, tier);
-        CodeAccount storage a = codeAccount[vault][code];
-        uint256 accumulated = (a.balanceNorm * lane[vault][tier].acc) / ACC;
-        uint256 pending = accumulated - a.rewardDebt; // acc monotonic -> never underflows
-        if (pending != 0) {
-            a.earned += pending;
-            vaultMeta[vault].totalArthaEarned += pending;
-            totalEarnedArtha += pending;
-            emit RewardSettled(vault, code, pending);
-        }
-        a.rewardDebt = accumulated;
-    }
-
-    // ───────────────────────────── configuration ────────────────────────────────
-
-    /// @notice Register a vault so referred balances in it earn reward.
-    function registerVault(address vault, uint8 decimals, uint256 rewardRatio_)
-        external
-        onlyReferralVaultManager
-    {
-        require(vault != address(0), "INVALID_VAULT");
-        require(!vaultMeta[vault].registered, "ALREADY_REGISTERED");
-        require(decimals <= 18, "DECIMALS_GT_18");
-        require(rewardRatio_ <= RATIO_ONE, "RATIO_GT_ONE");
-        require(vaultCount < type(uint64).max, "TOO_MANY_VAULTS");
-
-        uint256 scale = 10 ** (18 - decimals);
-        vaultMeta[vault] = VaultMeta({
-            registered: true,
-            decimals: decimals,
-            rewardRatio: rewardRatio_,
-            scale: scale,
-            totalPrincipalRaw: 0,
-            totalReferredNorm: 0,
-            totalArthaEarned: 0,
-            totalArthaClaimed: 0
-        });
-        unchecked {
-            vaultCount += 1;
-        }
-        emit VaultRegistered(vault, decimals, scale, rewardRatio_);
-    }
-
-    /// @notice Change a vault's reward ratio. Advances EVERY tier lane of this
-    ///         vault first (≤8) so the change is not retroactive.
-    function setRewardRatio(address vault, uint256 newRatio) external onlyReferralVaultManager {
-        require(vaultMeta[vault].registered, "NOT_REGISTERED");
-        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
-        uint256 n = registeredTiers.length;
-        for (uint256 i = 0; i < n; i++) {
-            _updateLane(vault, registeredTiers[i]); // bank old rate into each lane
-        }
-        uint256 old = vaultMeta[vault].rewardRatio;
-        vaultMeta[vault].rewardRatio = newRatio;
-        emit RewardRatioUpdated(vault, old, newRatio, block.timestamp);
-    }
-
-    /// @notice Set a tier's ratio. O(1): advances ONLY this tier's ratio-seconds
-    ///         integral (banking the old ratio up to now), then writes the new ratio.
-    ///         Vault lanes pick up the correct old/new split on next advance.
-    function setTierRatio(uint8 tier, uint256 newRatio) external onlyReferralVaultManager {
-        require(tier != 0, "INVALID_TIER");
-        require(newRatio <= RATIO_ONE, "RATIO_GT_ONE");
-        _syncTier(tier); // bank old ratio up to the change boundary
-        uint256 old = tierRatio[tier];
-        tierRatio[tier] = newRatio;
-        if (!_tierKnown[tier]) {
-            require(registeredTiers.length < MAX_TIERS, "TOO_MANY_TIERS");
-            _tierKnown[tier] = true;
-            if (tierLastUpdate[tier] == 0) tierLastUpdate[tier] = block.timestamp;
-            registeredTiers.push(tier);
-        }
-        emit TierRatioUpdated(tier, old, newRatio, block.timestamp);
-    }
-
-    /// @notice Promote/demote a code's tier. Banks the code at its OLD tier lane in
-    ///         each vault it uses, switches the tier, then re-checkpoints in the
-    ///         NEW tier lane — accrual before the change keeps the old tier's rate.
-    function setCodeTier(uint64 code, uint8 newTier) external onlyReferralVaultManager {
-        require(codeOwner[code] != address(0), "CODE_DOES_NOT_EXIST");
-        require(_tierKnown[newTier], "TIER_NOT_SET");
-
-        address[] storage list = codeVaults[code];
-        uint256 n = list.length;
-
-        // 1) bank everything at the current (old) tier.
-        for (uint256 i = 0; i < n; i++) {
-            _settle(list[i], code);
-        }
-        // 2) switch the tier (registry write in ReferralSystem).
-        uint8 oldTier = codeTier[code];
-        _setCodeTier(code, newTier);
-        // 3) re-checkpoint against the new tier lane so future accrual uses it.
-        for (uint256 i = 0; i < n; i++) {
-            address v = list[i];
-            _updateLane(v, newTier);
-            CodeAccount storage a = codeAccount[v][code];
-            a.rewardDebt = (a.balanceNorm * lane[v][newTier].acc) / ACC;
-        }
-        emit CodeTierChanged(code, oldTier, newTier);
-    }
-
-    // ─────────────────────────────── hooks ──────────────────────────────────────
+    // ═══════════════════════════ the split, in one place ════════════════════════
 
     /**
-     * @notice A deposit landed in `tokenId`. Grow the POSITION's referred balance.
+     * @dev THE single source of truth for the commission math -- code resolution
+     *      included. Both getInfo() (view) and settlePerformanceFee() (state) route
+     *      through here and do NOTHING else, so a divergence between what the vault
+     *      is quoted and what it is charged is impossible.
+     *
+     *  Ordering matters and is deliberate:
+     *    1. resolve the trader's ACTIVE code (dead code => unreferred).
+     *    2. ownerGross from the (vault, tier) ratio.
+     *    3. protocol = fee - ownerGross  <- SUBTRACTION. Absorbs all rounding dust,
+     *       guaranteeing ownerGross + protocol == fee to the wei.
+     *    4. discount carved out of ownerGross (the OWNER's money, not the protocol's).
+     *    5. ARTHA priced on ownerGross (see the contract comment: never on the net).
+     *
+     *  Every early-out returns the SAME shape: the protocol keeps the whole fee and
+     *  the referral programme takes nothing. `s.code == 0 || s.ownerGross == 0` is
+     *  the caller's "unreferred" signal.
+     */
+    function _split(address _vault, address _trader, uint256 _fee)
+        internal
+        view
+        returns (Split memory s)
+    {
+        s.protocolAmount = _fee; // the default in every early-out below
+
+        if (!_vaultData[_vault].registered || _fee == 0) return s;
+
+        uint64 code = activeTraderCode(_trader);
+        if (code == uint64(0)) return s;
+
+        // Defense-in-depth: the registry blocks binding your OWN code, but the admin
+        // could transfer a code TO someone who had already bound it as a trader.
+        // Re-check at settlement so a code can never pay its own owner.
+        if (codeOwner[code] == _trader) return s;
+
+        uint256 ratio = tierRewardRatio[_vault][codeTier[code]];
+        if (ratio == 0) return s; // vault never opened this tier -> no commission
+
+        s.code = code;
+        s.ownerGross = (_fee * ratio) / RATIO_ONE;  // ratio is capped less than max always
+        s.protocolAmount = _fee - s.ownerGross;
+
+        uint32 disc = codeDiscount[code];
+        s.discountAmount = disc == 0 ? 0 : (s.ownerGross * disc) / RATIO_ONE;
+        s.ownerNet = s.ownerGross - s.discountAmount;
+
+        s.arthaAmount = _quoteArtha(_vault, s.ownerGross);
+    }
+
+    /**
+     * @dev Convert a GROSS base commission into ARTHA, clamped to what is left of
+     *      the global budget.
+     *
+     *      raw -> norm18 (x scale) -> usd18 (x price / 1e8) -> artha (x ratio / 1e18)
+     */
+    function _quoteArtha(address _vault, uint256 _grossRaw) internal view returns (uint256) {
+        if (_grossRaw == 0) return 0;
+
+        VaultData storage v = _vaultData[_vault];
+        uint256 ratio = v.arthaRatio;
+        if (ratio == 0) return 0;
+
+        uint256 remaining = MAX_ARTHA - totalArthaMinted;
+        if (remaining == 0) return 0;
+
+        uint256 price = oracle.getPrice(v.baseAsset); // 8dp USD
+        if (price == 0) return 0;
+
+        uint256 norm18 = _grossRaw * v.scale;          // 18dp base
+        uint256 usd18 = (norm18 * price) / PRICE_ONE;  // 18dp USD
+        uint256 amount = (usd18 * ratio) / WAD;        // 18dp ARTHA
+
+        // Partial-fill at the cap -- never over, never silently zero.
+        return amount > remaining ? remaining : amount;
+    }
+
+    /**
+     * @dev Credit ARTHA under the global cap and return what was ACTUALLY granted.
+     *      Callers MUST book the return value, not their request: the books have to
+     *      mirror reality for rescue()'s solvency check to stay exact at the boundary.
+     */
+    function _creditArtha(address _vault, uint64 _code, uint256 _requested)
+        internal
+        returns (uint256 granted)
+    {
+        if (_requested == 0) return 0;
+
+        uint256 remaining = MAX_ARTHA - totalArthaMinted;
+        if (remaining == 0) return 0;
+
+        granted = _requested > remaining ? remaining : _requested;
+
+        totalArthaMinted += granted;
+        _earning[_vault][_code].totalEarnedArtha += granted;
+        _vaultData[_vault].totalArthaEarned += granted;
+
+        if (granted < _requested) {
+            emit ArthaCapReached(_requested, granted, totalArthaMinted);
+        }
+    }
+
+    /// @dev Record that `code` has a book in `vault`, so claimAll/deactivate can
+    ///      enumerate it without an unbounded scan of the global vault set.
+    function _touchCodeVault(uint64 _code, address _vault) internal {
+        if (!codeHasVault[_code][_vault]) {
+            codeHasVault[_code][_vault] = true;
+            codeVaults[_code].push(_vault);
+        }
+    }
+
+    // ═══════════════════════════ vault integration ══════════════════════════════
+
+    /**
+     * @notice Price a performance fee split WITHOUT mutating state. Call this from
+     *         the vault's withdraw path to learn how much to approve, and how much
+     *         of the fee to keep for the treasury.
+     * @param  vault           The vault paying the fee (its own address).
+     * @param  trader          The position owner the fee was charged to.
+     * @param  performanceFee  The full performance fee, raw base-token units.
+     * @return ownerGross      Referrer's commission BEFORE the trader discount.
+     * @return ownerNet        What the referrer actually banks (gross - discount).
+     * @return discountAmount  Base rebated to the trader.
+     * @return protocolAmount  Base the vault retains (performanceFee - ownerGross).
+     * @return arthaAmount     ARTHA credited to the referrer, priced on ownerGross.
+     * @return code            The trader's active code (0 => no referral at all).
+     */
+    function getInfo(address vault, address trader, uint256 performanceFee)
+        external
+        view
+        returns (
+            uint256 ownerGross,
+            uint256 ownerNet,
+            uint256 discountAmount,
+            uint256 protocolAmount,
+            uint256 arthaAmount,
+            uint64 code
+        )
+    {
+        Split memory s = _split(vault, trader, performanceFee);
+        return (s.ownerGross, s.ownerNet, s.discountAmount, s.protocolAmount, s.arthaAmount, s.code);
+    }
+
+    /**
+     * @notice Execute the split. Pulls `ownerNet + discountAmount` of base from the
+     *         calling vault (which must have approved at least that much) and
+     *         forwards `discountAmount` to the trader in the same transaction.
+     * @dev    onlyCaller(vault): msg.sender MUST equal `vault`.
+     */
+    function settlePerformanceFee(address vault, address trader, uint256 performanceFee)
+        external
+        nonReentrant
+        whenNotPaused
+        onlyCaller(vault)
+        returns (
+            uint256 ownerGross,
+            uint256 ownerNet,
+            uint256 discountAmount,
+            uint256 protocolAmount,
+            uint256 arthaAmount
+        )
+    {
+        require(_vaultData[vault].registered, "NOT_REGISTERED");
+
+        Split memory s = _split(vault, trader, performanceFee);
+
+        // Unreferred (or dead code, or tier not opened): nothing moves, nothing is
+        // pulled, and the vault keeps the entire fee.
+        if (s.ownerGross == 0) {
+            return (0, 0, 0, performanceFee, 0);
+        }
+
+        _bookCommission(vault, s);
+
+        emit CommissionSettled(
+            vault,
+            s.code,
+            trader,
+            performanceFee,
+            s.ownerGross,
+            s.ownerNet,
+            s.discountAmount,
+            s.protocolAmount,
+            s.arthaAmount
+        );
+
+        return (s.ownerGross, s.ownerNet, s.discountAmount, s.protocolAmount, s.arthaAmount);
+    }
+
+    /**
+     * @dev Write the books for one priced split and pull ONLY what stays here.
      *
      *  ┌──────────────────────────────────────────────────────────────────────┐
-     *  │  THE CODE COMES FROM THE POSITION, NOT FROM THE DEPOSITOR.           │
+     *  │  THE DISCOUNT NEVER ENTERS THIS CONTRACT.                            │
      *  │                                                                      │
-     *  │  On the FIRST referred deposit we BIND `_code` to the position and   │
-     *  │  it is immutable forever. On every later deposit -- by ANYONE, for   │
-     *  │  ANY reason -- we IGNORE the passed `_code` and use the bound one.   │
+     *  │  The rebate is the trader's money, the vault already holds the base, │
+     *  │  and the vault is paying that same trader out on this very call. So  │
+     *  │  the vault nets it into the trader's payout directly:                │
      *  │                                                                      │
-     *  │  That is what kills the phantom. If user-2 (holding Carol's code)    │
-     *  │  gifts capital into user-1's Bob-referred position, the capital      │
-     *  │  joins BOB's balance. Carol gets nothing -- correctly, since she     │
-     *  │  referred nothing. And when the OWNER later withdraws, we debit      │
-     *  │  BOB, the same key we credited. The books close.                     │
+     *  │      payout = principal + profit - protocolAmount - ownerNet         │
+     *  │                                                                      │
+     *  │  which is algebraically identical to paying the trader the discount  │
+     *  │  separately -- one transfer instead of two, and no float parked here │
+     *  │  that was never ours. We pull ONLY `ownerNet`: the referrer's        │
+     *  │  claimable balance is the only thing this contract must custody.     │
+     *  │                                                                      │
+     *  │  `totalDiscountBase` is still booked in full. It is an accounting    │
+     *  │  fact about what the code owner gave up, not a claim on any balance  │
+     *  │  here -- which is exactly why _outstandingBase subtracts it.         │
      *  └──────────────────────────────────────────────────────────────────────┘
-     *
-     * @param _vault        The calling vault. MUST equal msg.sender.
-     * @param _tokenId      The position the money went into.
-     * @param _owner        ownerOf(_tokenId) right now. Used for the self-referral
-     *                      check at bind time only.
-     * @param _code         The code to bind, IF this position is not yet bound.
-     *                      Ignored otherwise. Pass 0 for an unreferred deposit.
-     * @param _rawPrincipal NET base token credited (after the vault's entry fee).
      */
-    function notifyDeposit(
-        address _vault,
-        uint256 _tokenId,
-        address _owner,
-        uint64 _code,
-        uint256 _rawPrincipal
-    ) external onlyCaller(_vault) whenNotPaused {
-        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
-        if (_rawPrincipal == 0) return;
+    function _bookCommission(address vault, Split memory s) internal {
+        VaultData storage v = _vaultData[vault];
 
-        uint64 code = positionCode[_vault][_tokenId];
-
-        // ── first touch: bind the code to the POSITION, once, forever ──
-        if (code == uint64(0)) {
-            if (_code == uint64(0)) return;               // unreferred position
-            address owner = codeOwner[_code];
-            if (owner == address(0)) return;              // code deactivated/nonexistent
-            if (owner == _owner) return;                  // self-referral blocked
-            code = _code;
-            positionCode[_vault][_tokenId] = code;
-            emit PositionBound(_vault, _tokenId, code);
+        // Pull ONLY the referrer's net. The discount stays in the vault and is
+        // netted into the trader's payout there.
+        if (s.ownerNet != 0) {
+            IERC20(v.baseAsset).safeTransferFrom(vault, address(this), s.ownerNet);
         }
-        // else: ALREADY BOUND. `_code` is ignored entirely -- the position's code
-        // wins. This is what makes deposit and withdraw agree.
 
-        if (codeOwner[code] == address(0)) return;        // bound code since deactivated
+        Earning storage e = _earning[vault][s.code];
+        e.totalEarnedBase += s.ownerNet;
 
-        _settle(_vault, code); // bank at OLD balance
+        UserData storage u = _userData[vault][s.code];
+        u.totalVolumeBase += s.ownerGross;
 
-        uint256 addNorm = _rawPrincipal * vaultMeta[_vault].scale;
-        CodeAccount storage a = codeAccount[_vault][code];
-        a.balanceNorm += addNorm;
-        positionPrincipalNorm[_vault][_tokenId] += addNorm;
+        v.totalCommissionBase += s.ownerGross;
+        v.totalProtocolBase += s.protocolAmount;
+        totalEarnedBase += s.ownerNet;
 
-        VaultMeta storage m = vaultMeta[_vault];
-        m.totalPrincipalRaw += _rawPrincipal;
-        m.totalReferredNorm += addNorm;
-
-        a.rewardDebt = (a.balanceNorm * lane[_vault][codeTier[code]].acc) / ACC; // re-checkpoint
-
-        if (!codeHasVault[code][_vault]) {
-            codeHasVault[code][_vault] = true;
-            codeVaults[code].push(_vault);
+        if (s.discountAmount != 0) {
+            u.totalDiscountBase += s.discountAmount;
+            v.totalDiscountBase += s.discountAmount;
         }
-        emit Referred(_vault, code, _tokenId, _rawPrincipal, a.balanceNorm);
+
+        // ── ARTHA leg ── book what was GRANTED, not what was quoted.
+        s.arthaAmount = _creditArtha(vault, s.code, s.arthaAmount);
+
+        _touchCodeVault(s.code, vault);
     }
 
-    /**
-     * @notice Principal left `tokenId`. Shrink the POSITION's referred balance.
-     *
-     *  The code is read from `positionCode[_vault][_tokenId]` -- the SAME source
-     *  notifyDeposit credited. There is no `investor` parameter and no address
-     *  lookup, because the withdrawer's identity is irrelevant: the money left the
-     *  POSITION, so the POSITION's code is debited.
-     *
-     *  The debit is clamped to the position's OWN principal, not the code's total,
-     *  so one position can never eat another position's referred balance even if
-     *  the vault reports a wrong number.
-     *
-     * @param _rawPrincipal The COST BASIS consumed by this withdrawal, raw units.
-     *                      The vault MUST pass basisUsed, NOT the current value --
-     *                      reward principal tracks deposited capital, not value.
-     */
-    function notifyWithdraw(address _vault, uint256 _tokenId, uint256 _rawPrincipal)
-        external
-        onlyCaller(_vault)
-        whenNotPaused
-    {
-        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
-        if (_rawPrincipal == 0) return;
+    // ═════════════════════════════ claiming ═════════════════════════════════════
 
-        uint64 code = positionCode[_vault][_tokenId]; // <- SAME KEY AS DEPOSIT
-        if (code == uint64(0)) return;                // unreferred position
-
-        uint256 posNorm = positionPrincipalNorm[_vault][_tokenId];
-        if (posNorm == 0) return;
-
-        CodeAccount storage a = codeAccount[_vault][code];
-        if (a.balanceNorm == 0) return;
-
-        _settle(_vault, code); // bank up to now first
-
-        uint256 scale = vaultMeta[_vault].scale;
-        uint256 decNorm = _rawPrincipal * scale;
-
-        // clamp to THIS POSITION's principal -- never another position's
-        if (decNorm > posNorm) decNorm = posNorm;
-        if (decNorm > a.balanceNorm) decNorm = a.balanceNorm; // defensive
-
-        uint256 decRaw = decNorm / scale;
-
-        positionPrincipalNorm[_vault][_tokenId] = posNorm - decNorm;
-        a.balanceNorm -= decNorm;
-
-        VaultMeta storage m = vaultMeta[_vault];
-        m.totalReferredNorm -= decNorm;
-        m.totalPrincipalRaw = m.totalPrincipalRaw >= decRaw ? m.totalPrincipalRaw - decRaw : 0;
-
-        a.rewardDebt = (a.balanceNorm * lane[_vault][codeTier[code]].acc) / ACC;
-        emit Unreferred(_vault, code, _tokenId, decRaw, a.balanceNorm);
-    }
-
-    /**
-     * @notice The position's NFT changed hands.
-     *
-     *  THE CODE DOES NOT MOVE AND DOES NOT RESET. Bob referred the POSITION and the
-     *  capital he introduced is still in the vault, so Bob keeps earning on it.
-     *
-     *  Resetting the code on transfer would be an obvious wash: deposit under no
-     *  code, then transfer to yourself to re-bind under a code you own. Moving it
-     *  to the buyer's referrer would be worse -- it would pay someone who had
-     *  nothing to do with the capital entering the protocol.
-     *
-     *  This hook exists so the vault has ONE uniform integration shape across both
-     *  reward stacks, and so we can settle at the boundary for clean accounting.
-     *  It is a no-op for balances.
-     */
-    function notifyTransfer(address _vault, uint256 _tokenId, address _from, address _to)
-        external
-        onlyCaller(_vault)
-        whenNotPaused
-    {
-        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
-        if (_from == _to) return;
-
-        uint64 code = positionCode[_vault][_tokenId];
-        if (code == uint64(0)) return; // unreferred position: nothing to do
-
-        // Settle at the boundary so `earned` is exact as of the transfer.
-        // Balances are untouched: the code stays bound to the position.
-        _settle(_vault, code);
-    }
-
-    // ───────────────────────── permissionless sync ──────────────────────────────
-
-    /// @notice Anyone may bank a code's PENDING -> CLAIMABLE in one vault without
-    ///         claiming. Safe to call repeatedly (double-sync banks nothing extra).
-    function sync(address vault, uint64 code) public {
-        require(vaultMeta[vault].registered, "NOT_REGISTERED");
-        _settle(vault, code);
-    }
-
-    /// @notice Anyone may bank a code across every vault it uses.
-    function syncAll(uint64 code) external {
-        address[] storage list = codeVaults[code];
-        uint256 n = list.length;
-        for (uint256 i = 0; i < n; i++) _settle(list[i], code);
-    }
-
-    // ─────────────────────────────── claiming ───────────────────────────────────
-
-    /// @notice The code's CURRENT owner withdraws its ARTHA from one vault.
-    function claim(address vault, uint64 code, address to, uint256 amount)
+    function claimBase(address vault, uint64 code, address to, uint256 amount)
         public
         nonReentrant
         whenNotPaused
     {
-        require(vaultMeta[vault].registered, "NOT_REGISTERED");
+        require(_vaultData[vault].registered, "NOT_REGISTERED");
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
 
-        _settle(vault, code);
-        CodeAccount storage a = codeAccount[vault][code];
-        require(a.earned >= amount, "INSUFFICIENT_REWARDS");
+        Earning storage e = _earning[vault][code];
+        uint256 avail = e.totalEarnedBase - e.claimedBase;
+        require(avail >= amount, "INSUFFICIENT_BASE");
 
-        a.earned -= amount;
-        a.claimed += amount;
-        vaultMeta[vault].totalArthaClaimed += amount;
-        totalClaimedArtha += amount;
-        artha.safeTransfer(to, amount);
-        emit RewardClaimed(vault, code, msg.sender, to, amount);
+        e.claimedBase += amount;
+        vaultClaimedBase[vault] += amount;
+        totalClaimedBase += amount;
+
+        IERC20(_vaultData[vault].baseAsset).safeTransfer(to, amount);
+        emit BaseClaimed(vault, code, to, amount);
     }
 
-    /// @notice Claim the full earned balance across every vault the code uses.
+    function claimArtha(address vault, uint64 code, address to, uint256 amount)
+        public
+        nonReentrant
+        whenNotPaused
+    {
+        require(_vaultData[vault].registered, "NOT_REGISTERED");
+        require(to != address(0) && amount != 0, "INVALID_PARAMS");
+        require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
+
+        Earning storage e = _earning[vault][code];
+        uint256 avail = e.totalEarnedArtha - e.claimedArtha;
+        require(avail >= amount, "INSUFFICIENT_ARTHA");
+
+        e.claimedArtha += amount;
+        totalClaimedArtha += amount;
+
+        arthaToken.safeTransfer(to, amount);
+        emit ArthaClaimed(vault, code, to, amount);
+    }
+
     function claimAll(uint64 code, address to) external {
         require(codeOwner[code] == msg.sender, "NOT_CODE_OWNER");
         address[] storage list = codeVaults[code];
         uint256 n = list.length;
         for (uint256 i = 0; i < n; i++) {
             address v = list[i];
-            _settle(v, code);
-            uint256 amt = codeAccount[v][code].earned;
-            if (amt != 0) claim(v, code, to, amt);
+            Earning storage e = _earning[v][code];
+            uint256 b = e.totalEarnedBase - e.claimedBase;
+            if (b != 0) claimBase(v, code, to, b);
+            uint256 a = e.totalEarnedArtha - e.claimedArtha;
+            if (a != 0) claimArtha(v, code, to, a);
         }
     }
 
-    /// @notice Deactivate a code once fully wound down (zero balance and zero
-    ///         unclaimed) in every vault it used.
+    /**
+     * @dev Both legs must be empty in EVERY vault the code touched. Deactivation
+     *      clears ownership, and `claimBase`/`claimArtha` gate on
+     *      `codeOwner[code] == msg.sender` -- so a balance left behind at this point
+     *      is unreachable forever, by anyone. Hence the hard requires rather than a
+     *      convenience auto-claim: the owner must consciously take his money out
+     *      first, and if he cannot, the code stays alive.
+     */
     function deactivateCode(uint64 code) external {
         address[] storage list = codeVaults[code];
         uint256 n = list.length;
         for (uint256 i = 0; i < n; i++) {
-            address v = list[i];
-            _settle(v, code);
-            CodeAccount storage a = codeAccount[v][code];
-            require(a.balanceNorm == 0, "HAS_ACTIVE_BALANCE");
-            require(a.earned == 0, "HAS_UNCLAIMED_REWARDS");
+            Earning storage e = _earning[list[i]][code];
+            require(e.totalEarnedBase == e.claimedBase, "UNCLAIMED_BASE");
+            require(e.totalEarnedArtha == e.claimedArtha, "UNCLAIMED_ARTHA");
         }
         _deactivateCode(code);
     }
 
-    // ─────────────────────────────── rescue ─────────────────────────────────────
+    // ═════════════════════════════ admin ════════════════════════════════════════
 
+    function registerVault(address vault, address baseAsset, uint8 decimals, uint256 arthaRatio_)
+        external
+        onlyReferralVaultManager
+    {
+        require(vault != address(0) && baseAsset != address(0), "INVALID_PARAMS");
+        require(!_vaultData[vault].registered, "ALREADY_REGISTERED");
+        require(decimals >= 6 && decimals <= 18, "BAD_DECIMALS");
+
+        _vaultData[vault] = VaultData({
+            registered: true,
+            baseAsset: baseAsset,
+            scale: 10 ** (18 - decimals),
+            arthaRatio: arthaRatio_,
+            totalCommissionBase: 0,
+            totalDiscountBase: 0,
+            totalProtocolBase: 0,
+            totalArthaEarned: 0
+        });
+        registeredVaults.push(vault);
+
+        emit VaultRegistered(vault, baseAsset, arthaRatio_);
+    }
+
+    function setArthaRatio(address vault, uint256 arthaRatio_) external onlyReferralVaultManager {
+        require(_vaultData[vault].registered, "NOT_REGISTERED");
+        uint256 old = _vaultData[vault].arthaRatio;
+        _vaultData[vault].arthaRatio = arthaRatio_;
+        emit ArthaRatioUpdated(vault, old, arthaRatio_);
+    }
+
+    /**
+     * @dev The tier ladder for one vault. Higher tier => bigger slice of the
+     *      performance fee. Capped at RATIO_ONE so the referrer can never be owed
+     *      more than 100% of the fee (which would make `protocol = fee - gross`
+     *      underflow, and would mean paying out money the vault never charged).
+     */
+    function setTierRewardRatio(address vault, uint8 tier, uint256 ratio)
+        external
+        onlyReferralVaultManager
+    {
+        require(_vaultData[vault].registered, "NOT_REGISTERED");
+        require(tier != 0 && tier <= MAX_TIERS, "INVALID_TIER");
+        require(ratio <= RATIO_ONE, "RATIO_GT_ONE");
+
+        uint256 old = tierRewardRatio[vault][tier];
+        tierRewardRatio[vault][tier] = ratio;
+        emit TierRewardRatioUpdated(vault, tier, old, ratio);
+    }
+
+    /**
+     * @notice Promote/demote a code. ADMIN ONLY.
+     * @dev    No settlement dance is needed. Commission is priced per-fee at call
+     *         time and banked immediately, so there is no accrued position sitting
+     *         at the old rate to bank first -- the new tier simply applies from the
+     *         next performance fee onward. (The old time-accrual design DID need
+     *         this, which is why setCodeTier there had to walk every vault.)
+     */
+    function setCodeTier(uint64 code, uint8 newTier) external onlyReferralVaultManager {
+        _setCodeTier(code, newTier);
+    }
+
+    function setOracle(address newOracle) external onlyReferralVaultManager {
+        require(newOracle != address(0), "INVALID_ORACLE");
+        emit OracleUpdated(address(oracle), newOracle);
+        oracle = IOracle(newOracle);
+    }
+
+    /**
+     * @dev Sweeping ARTHA is bounded by what is OWED to code owners, and sweeping a
+     *      registered vault's base token is bounded by unclaimed commission. A rescue
+     *      must never be able to take money that is already someone's.
+     */
     function rescue(address token, address to, uint256 amount) external onlyReferralVaultManager {
         require(to != address(0) && amount != 0, "INVALID_PARAMS");
-        if (token == address(artha)) {
-            uint256 owed = totalEarnedArtha - totalClaimedArtha;
-            uint256 bal = artha.balanceOf(address(this));
+
+        uint256 owed;
+        if (token == address(arthaToken)) {
+            owed = totalArthaMinted - totalClaimedArtha;
+        } else {
+            owed = _outstandingBase(token);
+        }
+
+        if (owed != 0) {
+            uint256 bal = IERC20(token).balanceOf(address(this));
             uint256 excess = bal > owed ? bal - owed : 0;
             require(amount <= excess, "EXCEEDS_EXCESS");
         }
+
         IERC20(token).safeTransfer(to, amount);
         emit Rescued(token, to, amount);
     }
 
-    // ─────────────────────────────── views ──────────────────────────────────────
+    // ═════════════════════════════ views ════════════════════════════════════════
 
-    /// @notice Live claimable reward for a code in one vault (settled + accruing).
-    function pendingReward(address vault, uint64 code) public view returns (uint256) {
-        uint8 tier = codeTier[code];
-
-        uint256 ats = accTierSeconds[tier];
-        uint256 last = tierLastUpdate[tier];
-        if (last != 0 && block.timestamp > last) {
-            ats += tierRatio[tier] * (block.timestamp - last);
-        }
-
-        Lane storage L = lane[vault][tier];
-        uint256 accNow = L.acc;
-        if (L.init) {
-            uint256 dts = ats - L.tierSecondsMark;
-            uint256 rr = vaultMeta[vault].rewardRatio;
-            if (dts != 0 && rr != 0) accNow += (rr * dts * ACC) / (RATIO_SQ * YEAR);
-        }
-
-        CodeAccount storage a = codeAccount[vault][code];
-        uint256 accumulated = (a.balanceNorm * accNow) / ACC;
-        return a.earned + (accumulated - a.rewardDebt);
+    function arthaRemaining() external view returns (uint256) {
+        return MAX_ARTHA - totalArthaMinted;
     }
 
-    /// @notice Total live claimable for a code across every vault it uses.
-    function pendingRewardAll(uint64 code) external view returns (uint256 total) {
+    function vaultData(address vault) external view returns (VaultData memory) {
+        return _vaultData[vault];
+    }
+
+    function earningOf(address vault, uint64 code) external view returns (Earning memory) {
+        return _earning[vault][code];
+    }
+
+    function userDataOf(address vault, uint64 code) external view returns (UserData memory) {
+        return _userData[vault][code];
+    }
+
+    /// @notice Unclaimed base + ARTHA for a code in one vault.
+    function pendingOf(address vault, uint64 code)
+        public
+        view
+        returns (uint256 pendingBase, uint256 pendingArtha)
+    {
+        Earning storage e = _earning[vault][code];
+        pendingBase = e.totalEarnedBase - e.claimedBase;
+        pendingArtha = e.totalEarnedArtha - e.claimedArtha;
+    }
+
+    /// @notice Unclaimed ARTHA for a code across every vault it earned in, plus the
+    ///         per-vault base breakdown (base cannot be summed -- different tokens).
+    function pendingAll(uint64 code)
+        external
+        view
+        returns (address[] memory vaults, uint256[] memory baseAmounts, uint256 totalPendingArtha)
+    {
         address[] storage list = codeVaults[code];
         uint256 n = list.length;
-        for (uint256 i = 0; i < n; i++) total += pendingReward(list[i], code);
+        vaults = new address[](n);
+        baseAmounts = new uint256[](n);
+        for (uint256 i = 0; i < n; i++) {
+            vaults[i] = list[i];
+            (uint256 b, uint256 a) = pendingOf(list[i], code);
+            baseAmounts[i] = b;
+            totalPendingArtha += a;
+        }
     }
 
-    /// @notice Per-vault books: live principal (raw + normalised) and ARTHA flows.
+    /**
+     * @notice Everything the front-end needs about a CODE, in one call.
+     * @return owner_        Current owner (address(0) => deactivated).
+     * @return tier          Current tier id.
+     * @return discountBps   The owner's rebate setting, 1_000 = 1%.
+     * @return active        Whether the code can still be used.
+     * @return vaultCount    How many vaults this code has earned in.
+     * @return pendingArtha  Unclaimed ARTHA across all of them.
+     */
+    function codeInfo(uint64 code)
+        external
+        view
+        returns (
+            address owner_,
+            uint8 tier,
+            uint32 discountBps,
+            bool active,
+            uint256 vaultCount,
+            uint256 pendingArtha
+        )
+    {
+        owner_ = codeOwner[code];
+        tier = codeTier[code];
+        discountBps = codeDiscount[code];
+        active = isCodeActive(code);
+
+        address[] storage list = codeVaults[code];
+        vaultCount = list.length;
+        for (uint256 i = 0; i < vaultCount; i++) {
+            (, uint256 a) = pendingOf(list[i], code);
+            pendingArtha += a;
+        }
+    }
+
+    /**
+     * @notice Everything the front-end needs about a TRADER, in one call.
+     * @return code          The code they bound (may be dead -- see `active`).
+     * @return referrer      Who owns it now.
+     * @return tier          Its tier.
+     * @return discountBps   The rebate they receive on the referrer's commission.
+     * @return active        False => they are treated as unreferred and may rebind.
+     */
+    function traderInfo(address trader)
+        external
+        view
+        returns (uint64 code, address referrer, uint8 tier, uint32 discountBps, bool active)
+    {
+        code = traderCode[trader];
+        referrer = codeOwner[code];
+        tier = codeTier[code];
+        discountBps = codeDiscount[code];
+        active = isCodeActive(code);
+    }
+
+    /// @notice Lifetime base rebated to traders under `code` in `vault`, and the
+    ///         gross commission that rebate was carved out of.
+    function userInfo(address vault, uint64 code)
+        external
+        view
+        returns (uint256 totalDiscountBase, uint256 totalVolumeBase)
+    {
+        UserData storage u = _userData[vault][code];
+        return (u.totalDiscountBase, u.totalVolumeBase);
+    }
+
+    /**
+     * @notice A vault's full referral books.
+     * @return baseAsset          The vault's base token.
+     * @return arthaRatio_        ARTHA per 1 USD of commission, 18dp.
+     * @return commissionBase     Lifetime gross commission paid under this vault.
+     * @return discountBase       Lifetime base rebated to traders.
+     * @return protocolBase       Lifetime base retained by the protocol.
+     * @return arthaEarned        Lifetime ARTHA credited from this vault.
+     */
     function vaultBooks(address vault)
         external
         view
         returns (
-            uint256 rewardRatio_,
-            uint256 principalRaw,
-            uint256 principalNorm,
-            uint256 arthaEarned,
-            uint256 arthaClaimed,
-            uint256 arthaOutstanding
+            address baseAsset,
+            uint256 arthaRatio_,
+            uint256 commissionBase,
+            uint256 discountBase,
+            uint256 protocolBase,
+            uint256 arthaEarned
         )
     {
-        VaultMeta storage m = vaultMeta[vault];
+        VaultData storage v = _vaultData[vault];
         return (
-            m.rewardRatio,
-            m.totalPrincipalRaw,
-            m.totalReferredNorm,
-            m.totalArthaEarned,
-            m.totalArthaClaimed,
-            m.totalArthaEarned - m.totalArthaClaimed
+            v.baseAsset,
+            v.arthaRatio,
+            v.totalCommissionBase,
+            v.totalDiscountBase,
+            v.totalProtocolBase,
+            v.totalArthaEarned
         );
     }
 
-    /// @notice Live referred principal of one position, in raw base-token units.
-    function positionPrincipalRaw(address vault, uint256 tokenId) external view returns (uint256) {
-        return positionPrincipalNorm[vault][tokenId] / vaultMeta[vault].scale;
+    /// @notice Programme-wide totals. `outstandingArtha` is what this contract still
+    ///         owes code owners; keep its ARTHA balance at or above it.
+    function globalBooks()
+        external
+        view
+        returns (
+            uint256 arthaMinted,
+            uint256 arthaClaimed,
+            uint256 outstandingArtha,
+            uint256 arthaLeftInBudget,
+            uint256 baseEarned,
+            uint256 baseClaimed
+        )
+    {
+        return (
+            totalArthaMinted,
+            totalClaimedArtha,
+            totalArthaMinted - totalClaimedArtha,
+            MAX_ARTHA - totalArthaMinted,
+            totalEarnedBase,
+            totalClaimedBase
+        );
     }
 
     function codeVaultsCount(uint64 code) external view returns (uint256) {
         return codeVaults[code].length;
     }
 
-    function tiersCount() external view returns (uint256) {
-        return registeredTiers.length;
+    function registeredVaultsCount() external view returns (uint256) {
+        return registeredVaults.length;
+    }
+
+    /// @notice All vaults a code has earned in.
+    function codeVaultList(uint64 code) external view returns (address[] memory) {
+        return codeVaults[code];
     }
 
     // ─────────────────────────────── internal ───────────────────────────────────
 
-    function _initTier(uint8 tier, uint256 ratio) private {
-        tierRatio[tier] = ratio;
-        tierLastUpdate[tier] = block.timestamp; // start the integral clock now
-        _tierKnown[tier] = true;
-        registeredTiers.push(tier);
+    /**
+     * @dev Unclaimed commission denominated in `token`, summed across every
+     *      registered vault that uses it as its base asset. Bounds rescue().
+     *
+     *      net earned for a vault == gross commission - what was rebated to traders
+     *      (the rebate left the building at settlement time and was never owed to
+     *      the code owner). Subtract what has already been claimed to get the debt.
+     *
+     *      O(#vaults), view-only, admin path only.
+     */
+    function _outstandingBase(address token) internal view returns (uint256 owed) {
+        uint256 n = registeredVaults.length;
+        for (uint256 i = 0; i < n; i++) {
+            address vaultAddr = registeredVaults[i];
+            VaultData storage v = _vaultData[vaultAddr];
+            if (v.baseAsset != token) continue;
+
+            uint256 netEarned = v.totalCommissionBase - v.totalDiscountBase;
+            uint256 claimed = vaultClaimedBase[vaultAddr];
+            if (netEarned > claimed) owed += netEarned - claimed;
+        }
     }
 }

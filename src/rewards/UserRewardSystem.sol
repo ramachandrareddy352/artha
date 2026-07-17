@@ -12,197 +12,111 @@ import "./UserRewardManager.sol";
  *             UserRewardManager  <-  UserRewardSystem  <-  UserRewardVault
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   WORKED EXAMPLES -- READ THESE FIRST. THEY ARE THE WHOLE SPEC.
+ *   WHY KEYED BY (VAULT, POSITION ID) AND NOT BY (VAULT, USER ADDRESS)
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  Setup for every case: USDC vault, rewardRatio = 5e17 (50%/yr), YEAR = 360d.
- *  ARTHA for principal P over D days = 0.5 * P * D / 360.
- *
- *  ─────────────────────────────────────────────────────────────────────────
- *   CASE A -- TRANSFER *WITHOUT* REWARDS       (the DEFAULT: flag = false)
- *  ─────────────────────────────────────────────────────────────────────────
- *
- *    day 0     user-1 mints id-1, deposits 1,000 USDC
- *                positionAccount[V][1].balanceNorm = 1,000e18
- *
- *    day 90    user-1 transfers id-1 -> carol.  flag FALSE (never set).
- *                notifyTransfer(V, 1, user-1, carol)
- *                  -> _settle(V, 1, user-1)
- *                       banks 0.5 * 1,000 * 90/360 = 125 ARTHA to USER-1
- *                  -> flag false: the 125 STAYS with user-1
- *                  -> balanceNorm UNCHANGED at 1,000e18
- *                     (principal lives on the ID -- there is nothing to move)
- *                  -> carol is linked to the position
- *
- *    day 180   anyone syncs. _settle(V, 1, carol)
- *                banks 0.5 * 1,000 * 90/360 = 125 ARTHA to CAROL
- *
- *    RESULT    earned[user-1] = 125     <- theirs. carol can never touch it.
- *              earned[carol]  = 125     <- hers, from her own 90 days.
- *              user-1 may still call claimAll() and collect their 125.
- *
- *  ─────────────────────────────────────────────────────────────────────────
- *   CASE B -- TRANSFER *WITH* REWARDS          (flag = true, set beforehand)
- *  ─────────────────────────────────────────────────────────────────────────
- *
- *    day 0     user-1 mints id-1, deposits 1,000 USDC
- *
- *    day 89    user-1 calls setTransferRewardsOnExit(V, 1, true)
- *                transferRewardsOnExit[user-1][V][1] = true
- *                (their OWN transaction, ahead of time -- the vault never
- *                 passes a bool, exactly as specified)
- *
- *    day 90    user-1 transfers id-1 -> carol
- *                notifyTransfer(V, 1, user-1, carol)
- *                  -> _settle(V, 1, user-1) banks 125 to user-1
- *                  -> flag TRUE:
- *                       move positionEarnedForOwner[V][1][user-1] = 125
- *                       out of user-1's earned  ->  into CAROL's EARNED
- *                  -> it lands in `earned`, NOT pending, so carol can claim it
- *                     in the very next call. Correct: user-1 already took the
- *                     risk and already put in the time. That ARTHA is fully
- *                     EARNED, not still accruing -- pending is a function of
- *                     principal x time and cannot be written to directly.
- *                  -> the flag is CONSUMED (reset false)
- *
- *    day 180   _settle(V, 1, carol) banks another 125 to carol
- *
- *    RESULT    earned[user-1] = 0
- *              earned[carol]  = 250     <- the historical 125 + her own 125
- *
- *  ─────────────────────────────────────────────────────────────────────────
- *   CASE C -- user-2 GIFTS into user-1's position, THEN a flagged transfer
- *  ─────────────────────────────────────────────────────────────────────────
- *
- *    day 0     user-1 mints id-1, deposits 1,000 USDC
- *
- *    day 90    user-2 deposits 1,000 USDC into id-1   <- A GIFT to user-1.
- *                notifyDeposit(V, 1, owner=USER-1, 1,000)
- *                                     ^^^^^^^^^^^^ the OWNER, not user-2
- *                  -> _settle FIRST: banks 125 to USER-1
- *                  -> balanceNorm = 2,000e18
- *
- *                user-2 earns NOTHING. They made a gift; gifts do not earn.
- *                Nothing of user-2's is at risk here, so nothing of user-2's
- *                can strand. (This is the whole reason principal is id-keyed --
- *                see the section below.)
- *
- *    day 180   user-1 sets the flag, transfers id-1 -> carol
- *                  -> _settle banks 0.5 * 2,000 * 90/360 = 250 more to user-1
- *                     (on the FULL 2,000 -- the gift is part of the position)
- *                  -> positionEarnedForOwner[V][1][user-1] = 125 + 250 = 375
- *                  -> flag TRUE: all 375 moves to CAROL's earned
- *
- *    RESULT    earned[user-1] = 0
- *              earned[user-2] = 0        <- the gifter never earns
- *              earned[carol]  = 375
- *              carol owns id-1 holding 2,000 principal
- *
- *  ─────────────────────────────────────────────────────────────────────────
- *   CASE D -- THE HOLE THE FLAG CANNOT CLOSE. READ BEFORE TRUSTING IT.
- *  ─────────────────────────────────────────────────────────────────────────
- *
- *    day 90    mallory has 125 banked on id-1 and sets the flag TRUE.
- *              She lists id-1: "NFT + 125 ARTHA included". A buyer pays.
- *
- *              SAME BLOCK, front-running the transfer, mallory calls
- *                  claimAll(mallory)     -> the 125 leaves the contract
- *
- *              Then the transfer executes. The flag fires, looks for mallory's
- *              banked balance, finds ZERO, and moves ZERO.
- *
- *    RESULT    the buyer paid for 125 ARTHA and received none.
- *
- *              ┌──────────────────────────────────────────────────────────┐
- *              │  THE FLAG IS A GIFT INSTRUCTION, NOT AN ESCROW.          │
- *              │                                                          │
- *              │  A seller can always drain their own banked balance in   │
- *              │  the same block. No on-chain flag can prevent that --    │
- *              │  the balance is theirs until the instant it is not.      │
- *              │                                                          │
- *              │  A marketplace buyer MUST price the NFT at               │
- *              │  `shares x pps` and treat any ARTHA as a bonus that may  │
- *              │  not arrive -- or use an atomic bundle / escrow that     │
- *              │  checks claimableBanked(seller) in the same transaction. │
- *              └──────────────────────────────────────────────────────────┘
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   WHY PRINCIPAL IS KEYED BY (VAULT, POSITION ID) AND *NOT* BY USER ADDRESS
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  This is THE design decision in this contract, and Case C is why.
+ *  This is THE design decision in this contract. Read it before anything else.
  *
  *  The Artha vault allows ANYONE to deposit into ANY position, but only the
- *  position's OWNER may withdraw. That asymmetry breaks address-keyed
- *  accounting. The exact failure:
+ *  position's OWNER may withdraw. That asymmetry breaks address-keyed accounting.
+ *  Here is the exact failure:
  *
- *    day 0    user-1 deposits 1,000 into id-1.
- *    day 90   user-2 deposits 1,000 into id-1.
- *    day 180  user-1 (the OWNER) withdraws the full 2,000.
+ *    day 0    user-1 mints position id-1 and deposits 1,000 USDC.
+ *    day 90   user-2 deposits 1,000 USDC into id-1 (a gift to user-1).
+ *    day 180  user-1 (the OWNER) withdraws the full 2,000 USDC.
  *
  *  ── ADDRESS-KEYED, crediting the DEPOSITOR ────────────────────────────────
- *      principal[user-1] = 1,000        principal[user-2] = 1,000
+ *      principal[user-1] = 1,000        (their own deposit)
+ *      principal[user-2] = 1,000        (their gift)
  *
- *      user-1 withdraws 2,000. Subtract it from... whom?
+ *      user-1 withdraws 2,000. We must subtract 2,000 from... whom?
  *        - principal[user-1] is only 1,000  ->  UNDERFLOW. Clamp to 0.
  *        - principal[user-2] is still 1,000 ->  user-2 keeps accruing ARTHA
  *                                               on capital that HAS LEFT THE
  *                                               VAULT. Phantom principal.
  *
- *      The vault holds 0. The system thinks 1,000 is still earning. The pool
- *      bleeds forever, to someone with nothing at risk. THIS IS THE BUG.
+ *      Result: the vault holds 0, but the system thinks 1,000 is still earning.
+ *      The pool bleeds ARTHA forever, to someone who has no capital at risk.
+ *      THIS IS THE BUG.
+ *
+ *  ── ADDRESS-KEYED, crediting the OWNER ────────────────────────────────────
+ *      principal[user-1] = 2,000        (both deposits credited to the owner)
+ *      principal[user-2] = 0
+ *
+ *      user-1 withdraws 2,000 -> principal[user-1] = 0. Accounting closes.
+ *
+ *      This one *happens* to work -- but it is fragile. It relies on the vault
+ *      always passing the OWNER, never the depositor. And it still cannot answer
+ *      "how much principal does position id-1 hold?" without summing over every
+ *      address that ever touched it. On NFT transfer you must MOVE principal
+ *      between two address keys, which means reading the position's basis from
+ *      the vault and trusting it. More moving parts, more to get wrong.
  *
  *  ── ID-KEYED (this contract) ──────────────────────────────────────────────
- *      positionAccount[V][id-1].balanceNorm = 2,000
+ *      principal[vault][id-1] = 2,000   (both deposits land on the POSITION)
  *
- *      user-1 withdraws 2,000 -> balanceNorm = 0. Closes EXACTLY.
+ *      user-1 withdraws 2,000 -> principal[vault][id-1] = 0. Closes exactly.
+ *
+ *      The invariant that makes this work:
  *
  *          ┌────────────────────────────────────────────────────────────┐
  *          │  DEPOSIT credits (vault, id).                              │
  *          │  WITHDRAW debits (vault, id).                              │
  *          │  SAME KEY. ALWAYS. Regardless of who called either one.    │
  *          │                                                            │
- *          │  => balanceNorm can NEVER underflow and NEVER strand,      │
- *          │     because it is impossible to withdraw more from a       │
- *          │     position than was deposited into it.                   │
+ *          │  => principal[vault][id] can NEVER underflow, because it   │
+ *          │     is impossible to withdraw more from a position than    │
+ *          │     was deposited into it.                                 │
  *          └────────────────────────────────────────────────────────────┘
  *
- *  ┌──────────────────────────────────────────────────────────────────────────┐
- *  │  ON "SUBTRACT PRINCIPAL FROM THE OLD OWNER, ADD IT TO THE NEW OWNER".    │
- *  │                                                                          │
- *  │  There is no per-address principal balance to subtract from. The old      │
- *  │  owner never had one -- the POSITION holds the principal. Adding          │
- *  │  authoritative per-address mirrors and moving them on transfer would      │
- *  │  re-create the exact phantom bug above: deposit credits                   │
- *  │  owner-at-deposit-time, withdraw debits owner-at-withdraw-time, and the   │
- *  │  two disagree the moment ownership changes in between.                    │
- *  │                                                                          │
- *  │  The ATTRIBUTION does move, which is what actually matters: after the     │
- *  │  transfer the vault passes the NEW owner on every hook, so the new owner  │
- *  │  earns on that principal and the old owner does not. That is automatic    │
- *  │  and needs no bookkeeping.                                                │
- *  │                                                                          │
- *  │  Per-user principal totals are exposed as DERIVED VIEWS                   │
- *  │  (userPrincipalNorm / userPrincipalNormInVault) that sum the positions    │
- *  │  the user is linked to. Always exact, impossible to desync.               │
- *  └──────────────────────────────────────────────────────────────────────────┘
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   WHO GETS PAID: THE OWNER AT SETTLE TIME
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  Principal is tracked per POSITION, but ARTHA is credited to the position's
+ *  OWNER at the moment of settlement. The vault passes the current owner on every
+ *  hook. This gives the correct semantics for both of the awkward cases:
+ *
+ *    - user-2 deposits into user-1's position:
+ *        -> principal grows on id-1
+ *        -> ARTHA accrues to id-1
+ *        -> it is credited to user-1, the OWNER, because they are the one who
+ *           can withdraw the capital. user-2 made a GIFT. Gifts do not earn.
+ *
+ *    - user-1 transfers id-1 to carol on day 90:
+ *        -> the vault calls notifyTransfer(vault, id-1, user-1, carol)
+ *        -> we settle FIRST, banking 90 days of ARTHA to user-1
+ *        -> then the owner changes; carol accrues from her block 1
+ *        -> user-1 KEEPS the 125 ARTHA they already earned; it is in their
+ *           `earned` balance and carol can never touch it
+ *
+ *      Already-earned ARTHA never transfers with the NFT. It was earned by
+ *      user-1's capital being at risk for user-1's time. Selling the position
+ *      does not retroactively unearn it -- just as selling a stock does not
+ *      claw back a dividend already paid.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
  *   THE ACCUMULATOR
  *  ═══════════════════════════════════════════════════════════════════════════
  *
+ *  Standard MasterChef accumulator, one per vault:
+ *
  *      acc          += rewardRatio * dt * ACC / (RATIO_ONE * YEAR)
- *      accumulated   = balanceNorm * acc / ACC
+ *      accumulated   = principalNorm * acc / ACC
  *      pending       = accumulated - rewardDebt
  *
- *  Caller sites (msg.sender must be an approved caller AND equal `vault`):
+ *  Reward for a (vault, position) is:
+ *      (principalNorm * rewardRatio[vault]) / 1e18 per YEAR, YEAR = 360 days,
+ *      rewardRatio capped at 1e18 (= 100%/yr).
+ *
+ *  Caller sites (msg.sender must be an approved caller = the vault / Diamond):
  *     - deposit  -> notifyDeposit(vault, tokenId, owner, rawPrincipal)
- *     - withdraw -> notifyWithdraw(vault, tokenId, owner, basisUsed)
+ *     - withdraw -> notifyWithdraw(vault, tokenId, owner, rawPrincipal)
  *     - transfer -> notifyTransfer(vault, tokenId, from, to)
  *
- *  Anyone may sync() to bank a position's pending into claimable `earned`
- *  without claiming. Ratio changes are non-retroactive and never overpay, so
- *  correctness never depends on who (if anyone) calls sync.
+ *  Anyone may sync()/syncAll() to bank a position's pending into claimable
+ *  `earned` without claiming. Ratio changes are non-retroactive and never
+ *  overpay, so correctness does not depend on who (if anyone) calls sync.
  */
 abstract contract UserRewardSystem is UserRewardManager {
     // ─────────────────────────── constants ──────────────────────────────────────
@@ -219,17 +133,15 @@ abstract contract UserRewardSystem is UserRewardManager {
     // ─────────────────────────── vault config / books ───────────────────────────
 
     /**
-     * @param registered           whether the vault is active
-     * @param decimals             base-token decimals
-     * @param rewardRatio          per-vault rate (0..1e18). ZERO => NO REWARDS.
-     * @param scale                10^(18 - decimals), normalises principal to 18dp
+     * @param registered          whether the vault is active
+     * @param decimals            base-token decimals
+     * @param rewardRatio         per-vault rate (0..1e18). ZERO => NO REWARDS.
+     * @param scale               10^(18 - decimals), normalises principal to 18dp
      * @param accArthaPerPrincipal MasterChef accumulator, scaled by ACC
-     * @param lastUpdate           timestamp the accumulator last advanced
-     * @param totalPrincipalNorm   LIVE principal across all positions, 18dp
-     * @param totalDepositedRaw    LIFETIME principal ever deposited, raw units
-     * @param totalWithdrawnRaw    LIFETIME principal ever withdrawn, raw units
-     * @param totalArthaEarned     cumulative ARTHA credited for this vault
-     * @param totalArthaClaimed    cumulative ARTHA claimed from this vault
+     * @param lastUpdate          timestamp the accumulator last advanced
+     * @param totalPrincipalNorm  live principal across all positions, 18dp
+     * @param totalArthaEarned    cumulative ARTHA credited for this vault
+     * @param totalArthaClaimed   cumulative ARTHA claimed from this vault
      */
     struct VaultMeta {
         bool registered;
@@ -239,30 +151,17 @@ abstract contract UserRewardSystem is UserRewardManager {
         uint256 accArthaPerPrincipal;
         uint256 lastUpdate;
         uint256 totalPrincipalNorm;
-        uint256 totalDepositedRaw;
-        uint256 totalWithdrawnRaw;
         uint256 totalArthaEarned;
         uint256 totalArthaClaimed;
     }
 
     /**
-     * @param balanceNorm  LIVE principal for this (vault, tokenId), 18dp
-     * @param rewardDebt   checkpoint = balanceNorm * acc / ACC at last settle
-     * @param depositedRaw LIFETIME principal ever deposited here, raw units
-     * @param withdrawnRaw LIFETIME principal ever withdrawn here, raw units
-     *
-     *  INVARIANT: balanceNorm == (depositedRaw - withdrawnRaw) * scale
-     *
-     *  The lifetime counters are monotonic. They answer "how much has EVER gone
-     *  in / out of this position", which balanceNorm alone cannot: a position at
-     *  zero looks identical whether it never held anything or cycled a million
-     *  through and closed.
+     * @param balanceNorm live principal for this (vault, tokenId), 18dp
+     * @param rewardDebt  checkpoint = balanceNorm * acc / ACC at last settle
      */
     struct PositionAccount {
         uint256 balanceNorm;
         uint256 rewardDebt;
-        uint256 depositedRaw;
-        uint256 withdrawnRaw;
     }
 
     mapping(address => VaultMeta) public vaultMeta;
@@ -271,64 +170,22 @@ abstract contract UserRewardSystem is UserRewardManager {
     /// @notice vault => tokenId => accrual state. THE CORE MAPPING.
     mapping(address => mapping(uint256 => PositionAccount)) public positionAccount;
 
-    // ────────────────── the opt-in transfer flag (Cases A / B) ──────────────────
-
-    /**
-     * @notice user => vault => tokenId => "when I transfer this position, hand my
-     *         banked ARTHA from it to the new owner too".
-     *
-     *  Set by the OWNER, in their OWN transaction, BEFORE they transfer. The
-     *  vault passes no bool on the hook -- we read this standing instruction.
-     *  The flag is CONSUMED when it fires, so it can never trigger twice or
-     *  linger onto a future re-acquisition of the same tokenId.
-     *
-     *  Default FALSE: transferring an NFT does NOT give away your ARTHA. That is
-     *  the safe default -- ARTHA you earned by putting your own capital at risk
-     *  for your own time is yours. Selling the position does not unearn it, just
-     *  as selling a stock does not claw back a dividend already paid.
-     *
-     *  SEE CASE D at the top. This is a gift instruction, not an escrow.
-     */
-    mapping(address => mapping(address => mapping(uint256 => bool))) public transferRewardsOnExit;
-
-    /**
-     * @notice vault => tokenId => owner => ARTHA this position has banked FOR
-     *         THAT SPECIFIC OWNER since they acquired it.
-     *
-     *  This is the number the flag moves, and it has to be this precise:
-     *
-     *  Why not `totalEarned[user]`? It aggregates every vault and every position
-     *  they hold. Moving it would hand the buyer ARTHA from positions the seller
-     *  is KEEPING:
-     *      user-1 holds id-1 (selling, produced 375), id-7 (keeping, 900),
-     *      and a WETH position (keeping, 200).
-     *          totalEarned[user-1]                  = 1,475   <- WRONG to move
-     *          positionEarnedForOwner[V][1][user-1] =   375   <- RIGHT to move
-     *
-     *  Why not a lifetime per-position total? Because it would span owners. If
-     *  carol later sells to dave with the flag on, dave would receive user-1's
-     *  era too. Keying by owner keeps each era separate.
-     *
-     *  Zeroed for the old owner when the flag fires.
-     */
-    mapping(address => mapping(uint256 => mapping(address => uint256))) public positionEarnedForOwner;
-
     // ─────────────────────────── per-position footprint ─────────────────────────
 
     /// @notice vault => list of tokenIds that have ever held principal.
-    /// @dev    Append-only. Bounds syncAllPositions(vault).
+    /// @dev    Used to bound syncAllPositions(vault). Append-only.
     mapping(address => uint256[]) public vaultPositions;
     mapping(address => mapping(uint256 => bool)) public vaultHasPosition;
 
     // ─────────────────────────── per-user footprint ─────────────────────────────
 
     /**
-     * @notice user => list of (vault, tokenId) pairs they are linked to.
+     * @notice user => list of (vault, tokenId) pairs they currently own that have
+     *         ever held principal. Lets claimAll() settle everything in one tx.
      *
-     *  Lets claimAll() settle everything in one tx. Maintained on notifyDeposit
-     *  (links the owner) and notifyTransfer (links the buyer). Entries are NOT
-     *  removed -- a position you no longer own settles to zero pending for you,
-     *  which is harmless, and removal would cost an O(n) array shuffle.
+     *  Maintained on notifyDeposit (add to owner) and notifyTransfer (move from
+     *  old owner to new). Entries are NOT removed on withdraw -- a zero-principal
+     *  position settles to zero, which is harmless and keeps the code simple.
      */
     struct PositionRef {
         address vault;
@@ -344,39 +201,12 @@ abstract contract UserRewardSystem is UserRewardManager {
     event RewardRatioUpdated(address indexed vault, uint256 oldRatio, uint256 newRatio, uint256 at);
     event PrincipalIncreased(address indexed vault, uint256 indexed tokenId, address indexed owner, uint256 raw, uint256 newBalanceNorm);
     event PrincipalDecreased(address indexed vault, uint256 indexed tokenId, address indexed owner, uint256 raw, uint256 newBalanceNorm);
-    event PositionTransferred(address indexed vault, uint256 indexed tokenId, address indexed from, address to, uint256 bankedToFrom, uint256 arthaMoved);
+    event PositionTransferred(address indexed vault, uint256 indexed tokenId, address indexed from, address to, uint256 bankedToFrom);
     event Settled(address indexed vault, uint256 indexed tokenId, address indexed owner, uint256 amount);
-    event TransferRewardsOnExitSet(address indexed owner, address indexed vault, uint256 indexed tokenId, bool enabled);
 
     // ─────────────────────────── constructor ────────────────────────────────────
 
     constructor(address _rewardManager) UserRewardManager(_rewardManager) {}
-
-    // ═══════════════════ the opt-in flag (owner sets it themselves) ═════════════
-
-    /**
-     * @notice Declare that when you transfer this position, the ARTHA it banked
-     *         for you goes to the new owner as well.
-     *
-     *  CASE A (leave false, the default): you transfer the NFT, you keep your
-     *    ARTHA. The buyer starts earning from their block 1.
-     *
-     *  CASE B (set true): you transfer the NFT, and the ARTHA this position
-     *    banked for you moves into the buyer's `earned` -- immediately
-     *    claimable by them, because it is already earned, not still accruing.
-     *
-     *  You call this yourself, ahead of the transfer. The vault never passes a
-     *  bool; it just reports the transfer, and we read your standing instruction.
-     *
-     *  Consumed when it fires. Re-acquiring the position later means setting it
-     *  again if you want the same behaviour.
-     *
-     *  READ CASE D at the top of this file before relying on this in a trade.
-     */
-    function setTransferRewardsOnExit(address _vault, uint256 _tokenId, bool _enabled) external {
-        transferRewardsOnExit[msg.sender][_vault][_tokenId] = _enabled;
-        emit TransferRewardsOnExitSet(msg.sender, _vault, _tokenId, _enabled);
-    }
 
     // ═══════════════════════════ accrual core ═══════════════════════════════════
 
@@ -387,11 +217,12 @@ abstract contract UserRewardSystem is UserRewardManager {
      *  │  rewardRatio == 0  =>  NOTHING ACCRUES.                              │
      *  │                                                                      │
      *  │  The `if (ratio != 0)` guard is not strictly necessary -- multiplying │
-     *  │  by zero adds zero anyway. We keep it because it saves the           │
-     *  │  arithmetic and documents that ZERO IS THE OFF SWITCH.               │
+     *  │  by zero would add zero anyway. We keep it because:                   │
+     *  │    1. it saves the arithmetic and makes the intent explicit           │
+     *  │    2. it documents that ZERO IS THE OFF SWITCH                        │
      *  │                                                                      │
-     *  │  lastUpdate still advances, so turning the ratio back on does NOT    │
-     *  │  retroactively pay for the dark period. That is deliberate.          │
+     *  │  lastUpdate still advances, so turning the ratio back on does NOT     │
+     *  │  retroactively pay for the dark period. That is deliberate.           │
      *  └──────────────────────────────────────────────────────────────────────┘
      */
     function _updateAccumulator(address _vault) internal {
@@ -409,8 +240,8 @@ abstract contract UserRewardSystem is UserRewardManager {
     /**
      * @dev Bank a position's accrued ARTHA to `_owner`, then re-checkpoint.
      *
-     *  THE BANK-BEFORE-CHANGE RULE. The single most important pattern here.
-     *  Every caller must:
+     *  THE BANK-BEFORE-CHANGE RULE. This is the single most important pattern in
+     *  the engine. Every caller must:
      *
      *      1. _settle(...)          <- bank at the OLD principal
      *      2. change the principal
@@ -423,12 +254,9 @@ abstract contract UserRewardSystem is UserRewardManager {
      *  `accumulated` will equal `rewardDebt`.
      *
      * @param _owner Who receives the banked ARTHA. The vault passes the CURRENT
-     *               owner. On transfer this is the OLD owner -- settle first.
+     *               owner. On transfer, this is the OLD owner (settle first).
      */
-    function _settle(address _vault, uint256 _tokenId, address _owner)
-        internal
-        returns (uint256 banked)
-    {
+    function _settle(address _vault, uint256 _tokenId, address _owner) internal returns (uint256 banked) {
         _updateAccumulator(_vault);
 
         VaultMeta storage m = vaultMeta[_vault];
@@ -440,11 +268,10 @@ abstract contract UserRewardSystem is UserRewardManager {
         uint256 pending = accumulated - a.rewardDebt;
 
         if (pending != 0 && _owner != address(0)) {
-            // _credit lives in the Vault layer and is CAPPED. It may return less
-            // than `pending` (or zero) once the pool is exhausted.
+            // _credit is implemented by the Vault layer and is CAPPED. It may
+            // return less than `pending` (or zero) if the pool is exhausted.
             uint256 credited = _credit(_vault, _tokenId, _owner, pending);
             m.totalArthaEarned += credited;
-            positionEarnedForOwner[_vault][_tokenId][_owner] += credited;
             banked = credited;
             emit Settled(_vault, _tokenId, _owner, credited);
         }
@@ -468,29 +295,12 @@ abstract contract UserRewardSystem is UserRewardManager {
         }
     }
 
-    /// @dev Link `_user` to this position, for claimAll bounding.
+    /// @dev Track that `_user` owns this position, for claimAll bounding.
     function _linkUser(address _user, address _vault, uint256 _tokenId) internal {
         if (_user == address(0)) return;
         if (!userHasPosition[_user][_vault][_tokenId]) {
             userHasPosition[_user][_vault][_tokenId] = true;
             userPositions[_user].push(PositionRef({vault: _vault, tokenId: _tokenId}));
-        }
-    }
-
-    /// @dev Settle every position `_user` is linked to. Used before reading their
-    ///      banked balance, so `earned` is exact.
-    function _settleUserPositions(address _user) internal {
-        PositionRef[] storage list = userPositions[_user];
-        for (uint256 i; i < list.length; i++) {
-            _settle(list[i].vault, list[i].tokenId, _user);
-        }
-    }
-
-    /// @dev Settle every position `_user` is linked to WITHIN one vault.
-    function _settleUserPositionsInVault(address _user, address _vault) internal {
-        PositionRef[] storage list = userPositions[_user];
-        for (uint256 i; i < list.length; i++) {
-            if (list[i].vault == _vault) _settle(_vault, list[i].tokenId, _user);
         }
     }
 
@@ -520,8 +330,6 @@ abstract contract UserRewardSystem is UserRewardManager {
             accArthaPerPrincipal: 0,
             lastUpdate: block.timestamp,
             totalPrincipalNorm: 0,
-            totalDepositedRaw: 0,
-            totalWithdrawnRaw: 0,
             totalArthaEarned: 0,
             totalArthaClaimed: 0
         });
@@ -536,12 +344,12 @@ abstract contract UserRewardSystem is UserRewardManager {
      * @notice Change a vault's reward rate.
      *
      *  NON-RETROACTIVE: we advance the accumulator to `now` at the OLD rate
-     *  BEFORE writing the new one. Everything up to this second is banked at the
-     *  old rate; everything after accrues at the new one. Nobody is over- or
-     *  under-paid, and no per-position loop is needed -- the accumulator IS the
-     *  record of "old rate until here, new rate after".
+     *  BEFORE writing the new one. Everything earned up to this second is banked
+     *  into the accumulator at the old rate; everything after accrues at the new
+     *  one. Nobody is over- or under-paid, and no per-position loop is needed --
+     *  the accumulator IS the record of "old rate until here, new rate after".
      *
-     *  `_newRatio = 0` is the clean OFF SWITCH (see _updateAccumulator).
+     *  Setting `_newRatio = 0` is the clean OFF SWITCH (see _updateAccumulator).
      */
     function setRewardRatio(address _vault, uint256 _newRatio) external onlyRewardManager {
         require(vaultMeta[_vault].registered, "NOT_REGISTERED");
@@ -574,8 +382,8 @@ abstract contract UserRewardSystem is UserRewardManager {
     /**
      * @notice A deposit landed in `_tokenId`. Grow the POSITION's principal.
      *
-     *  Called on EVERY deposit -- including when a third party deposits into
-     *  someone else's position (CASE C). The vault passes:
+     *  Called by the vault on EVERY deposit -- including when a third party
+     *  deposits into someone else's position. The vault passes:
      *    - `_tokenId`: the position the money went into      <- principal key
      *    - `_owner`:   ownerOf(_tokenId) at this moment      <- who gets ARTHA
      *
@@ -597,13 +405,10 @@ abstract contract UserRewardSystem is UserRewardManager {
         _settle(_vault, _tokenId, _owner);
 
         // 2. CHANGE the principal -- on the POSITION
-        VaultMeta storage m = vaultMeta[_vault];
-        uint256 addNorm = _rawPrincipal * m.scale;
+        uint256 addNorm = _rawPrincipal * vaultMeta[_vault].scale;
         PositionAccount storage a = positionAccount[_vault][_tokenId];
         a.balanceNorm += addNorm;
-        a.depositedRaw += _rawPrincipal; // lifetime counter
-        m.totalPrincipalNorm += addNorm;
-        m.totalDepositedRaw += _rawPrincipal;
+        vaultMeta[_vault].totalPrincipalNorm += addNorm;
 
         // 3. RE-CHECKPOINT at the new principal
         _recheckpoint(_vault, _tokenId);
@@ -625,7 +430,7 @@ abstract contract UserRewardSystem is UserRewardManager {
      *  │  must drop by 9,970 -- what they actually put in.                    │
      *  │                                                                      │
      *  │  Passing `assets` (11,094) would drive principal negative on any     │
-     *  │  profitable position. It clamps below, but the clamp is a symptom:   │
+     *  │  profitable position. It clamps here, but the clamp is a symptom:    │
      *  │  the vault would be reporting the wrong number. This is the kind of  │
      *  │  bug that only appears after a bull run.                             │
      *  └──────────────────────────────────────────────────────────────────────┘
@@ -651,50 +456,43 @@ abstract contract UserRewardSystem is UserRewardManager {
         _settle(_vault, _tokenId, _owner);
 
         // 2. CHANGE the principal
-        VaultMeta storage m = vaultMeta[_vault];
-        uint256 decNorm = _rawPrincipal * m.scale;
+        uint256 decNorm = _rawPrincipal * vaultMeta[_vault].scale;
         if (decNorm > a.balanceNorm) decNorm = a.balanceNorm; // defensive clamp
-        uint256 decRaw = decNorm / m.scale;
-
         a.balanceNorm -= decNorm;
-        a.withdrawnRaw += decRaw; // lifetime counter, post-clamp
-        m.totalPrincipalNorm -= decNorm;
-        m.totalWithdrawnRaw += decRaw;
+        vaultMeta[_vault].totalPrincipalNorm -= decNorm;
 
         // 3. RE-CHECKPOINT
         _recheckpoint(_vault, _tokenId);
 
-        emit PrincipalDecreased(_vault, _tokenId, _owner, decRaw, a.balanceNorm);
+        emit PrincipalDecreased(_vault, _tokenId, _owner, _rawPrincipal, a.balanceNorm);
     }
 
     /**
-     * @notice The NFT changed hands. Settle to the OLD owner, then honour their
-     *         standing instruction about the ARTHA.
+     * @notice The NFT changed hands. Settle to the OLD owner; the NEW owner
+     *         accrues from now.
      *
-     *  ── WHAT ALWAYS HAPPENS ──────────────────────────────────────────────
-     *    _settle(from) runs unconditionally. It converts the seller's PENDING
-     *    into their banked `earned`, at the rate their capital actually earned
-     *    over the time they actually held it. Not optional: without it the buyer
-     *    would inherit un-banked pending that the SELLER earned.
+     *  ┌──────────────────────────────────────────────────────────────────────┐
+     *  │  PRINCIPAL DOES NOT MOVE. It is keyed by (vault, tokenId), and the    │
+     *  │  tokenId did not change -- only its owner did. This is the single     │
+     *  │  biggest simplification id-keying buys us: an address-keyed design    │
+     *  │  would have to read the position's basis from the vault and move it   │
+     *  │  between two address keys, banking BOTH sides. Here we bank one side  │
+     *  │  and re-point the owner.                                             │
+     *  │                                                                      │
+     *  │  ALREADY-EARNED ARTHA STAYS WITH THE SELLER. It lives in `earned[]`   │
+     *  │  in the Vault layer, keyed by user address. The buyer cannot touch    │
+     *  │  it. `claimed[]` is likewise per-user, so there is no ambiguity about │
+     *  │  who has claimed what -- the two users' ledgers never intersect.      │
+     *  └──────────────────────────────────────────────────────────────────────┘
      *
-     *  ── WHAT THE FLAG DECIDES ────────────────────────────────────────────
-     *    CASE A  flag false (default): the banked ARTHA STAYS with the seller.
-     *    CASE B  flag true:            it MOVES into the buyer's `earned`,
-     *                                  immediately claimable.
+     *  Sequence:
+     *    1. settle(from)      -> banks every ARTHA the seller earned, to SELLER
+     *    2. rewardDebt is now re-marked at the SAME principal
+     *    3. buyer is linked to the position; from block N+1 all pending accrues
+     *       to them, because the vault will pass `to` as `_owner` on the next hook
      *
-     *    We move `positionEarnedForOwner[vault][tokenId][from]` -- what THIS
-     *    position banked for THIS seller -- never their global `earned`, which
-     *    would leak ARTHA from positions they are keeping.
-     *
-     *  ── WHAT NEVER HAPPENS ───────────────────────────────────────────────
-     *    Principal does not move. It is keyed by (vault, tokenId) and the
-     *    tokenId did not change -- only its owner did. The new owner earns on it
-     *    from now, because the vault passes `to` as `_owner` on the next hook.
-     *    See the note at the top on why per-address principal mirrors would
-     *    re-introduce the phantom bug.
-     *
-     *  Mint (from == 0) and burn (to == 0) are accrual no-ops: a fresh position
-     *  has zero principal, and a burned one was already emptied by
+     *  Mint (from == 0) and burn (to == 0) are both no-ops for accrual: a fresh
+     *  position has zero principal, and a burned one has already been emptied by
      *  notifyWithdraw. We still link the new owner so claimAll() finds it.
      */
     function notifyTransfer(address _vault, uint256 _tokenId, address _from, address _to)
@@ -706,42 +504,26 @@ abstract contract UserRewardSystem is UserRewardManager {
         if (_from == _to) return;
 
         uint256 banked;
-        uint256 movedAmt;
-
         if (_from != address(0)) {
-            // ALWAYS bank the seller's pending: their rate, their time.
+            // Bank everything the SELLER earned, before the owner pointer moves.
             banked = _settle(_vault, _tokenId, _from);
-
-            // Then read their standing instruction (CASE A vs CASE B).
-            if (transferRewardsOnExit[_from][_vault][_tokenId] && _to != address(0)) {
-                movedAmt = _moveEarned(_vault, _tokenId, _from, _to);
-                // consume the flag: fires once, never lingers
-                transferRewardsOnExit[_from][_vault][_tokenId] = false;
-                emit TransferRewardsOnExitSet(_from, _vault, _tokenId, false);
-            }
         } else {
-            // Mint: nothing to bank, but keep the accumulator current so the new
-            // position's rewardDebt marks against an up-to-date acc.
+            // Mint: nothing to bank, but make sure the accumulator is current so
+            // the new position's rewardDebt marks against an up-to-date acc.
             _updateAccumulator(_vault);
             _recheckpoint(_vault, _tokenId);
         }
 
         _linkUser(_to, _vault, _tokenId);
-        emit PositionTransferred(_vault, _tokenId, _from, _to, banked, movedAmt);
+        emit PositionTransferred(_vault, _tokenId, _from, _to, banked);
     }
 
     // ═══════════════════════════ permissionless sync ════════════════════════════
 
     /**
      * @notice Bank one position's pending into claimable `earned`, without
-     *         claiming. ANYONE may call.
-     *
-     *  This is the "sync before you transfer" path: an owner who wants their
-     *  ARTHA crystallised before selling calls this, then transfers. (Belt-and-
-     *  braces -- notifyTransfer settles anyway.)
-     *
-     *  Correctness never depends on this being called.
-     *
+     *         claiming. Anyone may call. Correctness never depends on this being
+     *         called -- it is a convenience for UIs and accounting snapshots.
      * @param _owner The position's current owner. Callers should pass
      *               `IERC721(vault).ownerOf(tokenId)`.
      */
@@ -750,22 +532,10 @@ abstract contract UserRewardSystem is UserRewardManager {
         _settle(_vault, _tokenId, _owner);
     }
 
-    /// @notice Bank every position `_user` is linked to, across every vault.
-    function syncUser(address _user) external {
-        _settleUserPositions(_user);
-    }
-
-    /// @notice Bank every position `_user` is linked to within ONE vault.
-    function syncUserInVault(address _user, address _vault) external {
-        require(vaultMeta[_vault].registered, "NOT_REGISTERED");
-        _settleUserPositionsInVault(_user, _vault);
-    }
-
     /**
      * @notice Bank every position in a vault. Bounded by vaultPositions[vault].
-     * @dev    O(n) over all positions ever created in the vault. For keeper /
-     *         off-chain use, not a user tx. `_owners` must be supplied in the
-     *         same order as `vaultPositions[_vault]`.
+     * @dev    O(n) over all positions ever created in the vault. Intended for
+     *         off-chain/keeper use, not for a user tx. Provided for completeness.
      */
     function syncAllPositions(address _vault, address[] calldata _owners) external {
         require(vaultMeta[_vault].registered, "NOT_REGISTERED");
@@ -780,7 +550,7 @@ abstract contract UserRewardSystem is UserRewardManager {
 
     /**
      * @notice Live pending (un-banked) ARTHA for one position.
-     * @dev    Mirrors _settle's math WITHOUT writing. Must stay in step with
+     * @dev    Mirrors _settle's math WITHOUT writing. Must stay in sync with
      *         _updateAccumulator -- including the `rewardRatio == 0` guard.
      */
     function pendingReward(address _vault, uint256 _tokenId) public view returns (uint256) {
@@ -797,7 +567,7 @@ abstract contract UserRewardSystem is UserRewardManager {
         return accumulated - a.rewardDebt;
     }
 
-    /// @notice Total pending across every position `_user` is linked to.
+    /// @notice Total pending across every position `_user` currently owns.
     function pendingRewardAll(address _user) public view returns (uint256 total) {
         PositionRef[] storage list = userPositions[_user];
         for (uint256 i; i < list.length; i++) {
@@ -805,36 +575,13 @@ abstract contract UserRewardSystem is UserRewardManager {
         }
     }
 
-    /// @notice Total pending for `_user` within ONE vault.
-    function pendingRewardInVault(address _user, address _vault)
-        public
-        view
-        returns (uint256 total)
-    {
-        PositionRef[] storage list = userPositions[_user];
-        for (uint256 i; i < list.length; i++) {
-            if (list[i].vault == _vault) total += pendingReward(_vault, list[i].tokenId);
-        }
-    }
-
-    /**
-     * @notice Everything about one vault's books.
-     * @return rewardRatio_     per-year rate, 0..1e18
-     * @return principalNorm    LIVE principal across all positions, 18dp
-     * @return depositedRaw     LIFETIME principal ever deposited
-     * @return withdrawnRaw     LIFETIME principal ever withdrawn
-     * @return arthaEarned      cumulative ARTHA credited
-     * @return arthaClaimed     cumulative ARTHA claimed
-     * @return arthaOutstanding earned - claimed
-     */
+    /// @notice Convenience read of a vault's books.
     function vaultBooks(address _vault)
         external
         view
         returns (
             uint256 rewardRatio_,
             uint256 principalNorm,
-            uint256 depositedRaw,
-            uint256 withdrawnRaw,
             uint256 arthaEarned,
             uint256 arthaClaimed,
             uint256 arthaOutstanding
@@ -844,74 +591,15 @@ abstract contract UserRewardSystem is UserRewardManager {
         return (
             m.rewardRatio,
             m.totalPrincipalNorm,
-            m.totalDepositedRaw,
-            m.totalWithdrawnRaw,
             m.totalArthaEarned,
             m.totalArthaClaimed,
             m.totalArthaEarned - m.totalArthaClaimed
         );
     }
 
-    /// @notice LIVE principal on a position, in raw base-token units.
-    function positionPrincipalRaw(address _vault, uint256 _tokenId) public view returns (uint256) {
-        uint256 scale = vaultMeta[_vault].scale;
-        return scale == 0 ? 0 : positionAccount[_vault][_tokenId].balanceNorm / scale;
-    }
-
-    /**
-     * @notice Everything about one position's PRINCIPAL.
-     * @return livePrincipalRaw  currently invested, raw base units
-     * @return livePrincipalNorm currently invested, 18dp
-     * @return depositedRaw      LIFETIME ever deposited into this position
-     * @return withdrawnRaw      LIFETIME ever withdrawn from this position
-     * @return pendingArtha      un-banked ARTHA accruing on it right now
-     */
-    function positionBooks(address _vault, uint256 _tokenId)
-        external
-        view
-        returns (
-            uint256 livePrincipalRaw,
-            uint256 livePrincipalNorm,
-            uint256 depositedRaw,
-            uint256 withdrawnRaw,
-            uint256 pendingArtha
-        )
-    {
-        PositionAccount storage a = positionAccount[_vault][_tokenId];
-        return (
-            positionPrincipalRaw(_vault, _tokenId),
-            a.balanceNorm,
-            a.depositedRaw,
-            a.withdrawnRaw,
-            pendingReward(_vault, _tokenId)
-        );
-    }
-
-    /**
-     * @notice Total LIVE principal across every position `_user` is linked to, 18dp.
-     * @dev    DERIVED, not stored. Sums the positions -- always exact, can never
-     *         desync from the authoritative id-keyed balances. See the note at the
-     *         top of this file on why this is a view and not state.
-     */
-    function userPrincipalNorm(address _user) public view returns (uint256 total) {
-        PositionRef[] storage list = userPositions[_user];
-        for (uint256 i; i < list.length; i++) {
-            total += positionAccount[list[i].vault][list[i].tokenId].balanceNorm;
-        }
-    }
-
-    /// @notice Total LIVE principal `_user` holds in ONE vault, 18dp. Derived.
-    function userPrincipalNormInVault(address _user, address _vault)
-        public
-        view
-        returns (uint256 total)
-    {
-        PositionRef[] storage list = userPositions[_user];
-        for (uint256 i; i < list.length; i++) {
-            if (list[i].vault == _vault) {
-                total += positionAccount[_vault][list[i].tokenId].balanceNorm;
-            }
-        }
+    /// @notice Live principal on a position, in raw base-token units.
+    function positionPrincipalRaw(address _vault, uint256 _tokenId) external view returns (uint256) {
+        return positionAccount[_vault][_tokenId].balanceNorm / vaultMeta[_vault].scale;
     }
 
     function vaultPositionsCount(address _vault) external view returns (uint256) {
@@ -932,12 +620,12 @@ abstract contract UserRewardSystem is UserRewardManager {
         return (r.vault, r.tokenId);
     }
 
-    // ═══════════════════════════ money hooks ════════════════════════════════════
+    // ═══════════════════════════ money hook ═════════════════════════════════════
 
     /**
-     * @dev Implemented by the Vault layer. Credits `_amount` ARTHA to `_owner`,
-     *      CAPPED by the remaining pool. Returns what was actually credited,
-     *      which may be less than requested (or zero).
+     * @dev Implemented by the Vault layer (UserRewardVault). Credits `_amount`
+     *      ARTHA to `_owner`, CAPPED by the remaining pool. Returns the amount
+     *      actually credited, which may be less than requested (or zero).
      *
      *      This is the ONLY seam between logic and money. The System never holds,
      *      transfers, or mints ARTHA -- it only decides who is owed what.
@@ -946,13 +634,4 @@ abstract contract UserRewardSystem is UserRewardManager {
         internal
         virtual
         returns (uint256 credited);
-
-    /**
-     * @dev Implemented by the Vault layer. Moves the ARTHA this position banked
-     *      for `_from` into `_to`'s `earned` (CASE B). Returns the amount moved.
-     */
-    function _moveEarned(address _vault, uint256 _tokenId, address _from, address _to)
-        internal
-        virtual
-        returns (uint256 moved);
 }
