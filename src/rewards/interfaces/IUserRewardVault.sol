@@ -1,86 +1,72 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-/// @notice Local Chainlink wrapper. Returns USD price at 8 decimals.
-/// @dev Same shape the referral stack uses -- one oracle serves both stacks.
-interface IOracle {
-    function getPrice(address baseAsset) external view returns (uint256);
-}
-
-/// @notice The one view the reward stack needs from an Artha vault.
-interface IArthaVault {
-    /// @notice Price of one share denominated in the base asset, scaled to 1e18.
-    /// @dev MUST be derived from totalAssets()/totalSupply(). If this is ever an
-    ///      admin-written number, whoever holds that key can mint ARTHA at will --
-    ///      the entire reward book is priced off it.
-    function pricePerShare() external view returns (uint256);
-}
-
 /**
  * @title IUserRewardVault
- * @notice Integration surface for the user-staking-reward stack.
+ * @notice Integration surface for the simple user-staking-reward programme.
  *
- *  Vault layer:  call notifyShareChange() whenever shares move OUTSIDE stake()/
- *                unstake() -- transfers, mints, burns. Read getInfo() for display.
- *  Front-end:    getInfo() / pendingOf() for a position, vaultBooks() for a vault,
- *                globalBooks() for the programme.
+ *  Users stake a vault's share token directly here -- there is no vault-side
+ *  integration, no oracle, and no shared pool: every staked share earns independently
+ *  of how much anyone else has staked. Each vault has an admin-set ARTHA-per-share-
+ *  per-second rate that can change over time; a rate-time index (see
+ *  IUserRewardSystem) banks each rate's contribution the moment it changes, so a
+ *  position settled across a rate change is priced correctly for both stretches.
+ *  See UserRewardSystem/UserRewardVault for the full design notes.
  */
 interface IUserRewardVault {
-    // ── vault integration ──
-
-    /// @notice Report a share movement the vault performed. msg.sender MUST == vault.
-    /// @dev Never reverts on accrual failure; emits SettleFailed instead, so a stale
-    ///      oracle cannot brick the vault's deposit/withdraw path.
-    function notifyShareChange(address vault, address user, uint256 oldShares, uint256 newShares) external;
-
-    /// @notice Everything the front-end needs about one position, in one call.
-    /// @return stakedShares Shares currently staked.
-    /// @return pendingUSD   Settled + unsettled USD, 18dp.
-    /// @return pendingArtha What claiming right now would ACTUALLY pay (cap included).
-    /// @return rateBps      The vault's APR in force now. 1_000 = 1%.
-    /// @return stakedAt     First-ever stake timestamp.
-    function getInfo(address vault, address user)
-        external
-        view
-        returns (uint256 stakedShares, uint256 pendingUSD, uint256 pendingArtha, uint256 rateBps, uint256 stakedAt);
-
     // ── user ──
 
-    function stake(address vault, uint256 amount) external;
+    /// @notice Stake vault shares to start earning ARTHA. Caller must approve first.
+    /// @dev    Shares are pulled from msg.sender but credited to `user` -- anyone can
+    ///         stake on another user's behalf. Only `user` can later unstake or claim.
+    function stake(address vault, address user, uint256 amount) external;
+
+    /// @notice Withdraw staked shares. Earned ARTHA is banked, not forfeited.
+    /// @dev    Only the position owner (msg.sender) can unstake their own position.
     function unstake(address vault, uint256 amount) external;
-    function settle(address vault, address user) external;
-    function claimArtha(address vault, address to, uint256 amount) external;
-    function claimAll(address to) external;
+
+    /// @notice Claim all ARTHA earned by the caller's own position in `vault`.
+    function claimArtha(address vault) external;
 
     // ── views ──
 
     function artha() external view returns (address);
+
+    /// @notice ARTHA left in the 10M lifetime budget.
     function arthaRemaining() external view returns (uint256);
-    function sharePriceUSD(address vault) external view returns (uint256);
-    function currentRate(address vault) external view returns (uint256);
+
+    /// @notice ARTHA accrued but not yet claimed. Keep the balance at or above this.
+    function outstandingArtha() external view returns (uint256);
+
+    /// @notice Settled + unsettled ARTHA for a user in a vault. Cap-aware.
+    function pendingArtha(address vault, address user) external view returns (uint256);
+
+    /// @notice A vault's ARTHA per share per second, 1e18 fixed point.
+    function rewardRateOf(address vault) external view returns (uint256);
+
     function stakedShares(address vault, address user) external view returns (uint256);
 
-    function pendingOf(address vault, address user)
-        external
-        view
-        returns (uint256 pendingUSD, uint256 pendingArtha);
-
-    function pendingAll(address user)
-        external
-        view
-        returns (address[] memory vaults, uint256[] memory usdAmounts, uint256 totalPendingArtha);
-
-    function vaultBooks(address vault)
+    /// @notice Everything the front-end needs about one position, in one call.
+    /// @return stakedShares_      Shares currently staked.
+    /// @return pendingArtha_      Settled + unsettled ARTHA.
+    /// @return totalEarnedArtha_  Lifetime ARTHA ever earned here (includes claimed).
+    /// @return totalClaimedArtha_ Lifetime ARTHA ever withdrawn from here.
+    /// @return rewardRate_        ARTHA per share per second for this vault.
+    function getInfo(address vault, address user)
         external
         view
         returns (
-            address shareToken,
-            uint256 rateBps,
-            uint256 arthaRatio,
             uint256 stakedShares_,
-            uint256 earnedUSD,
-            uint256 arthaIssued
+            uint256 pendingArtha_,
+            uint256 totalEarnedArtha_,
+            uint256 totalClaimedArtha_,
+            uint256 rewardRate_
         );
+
+    function vaultInfo(address vault)
+        external
+        view
+        returns (bool registered, address shareToken, uint256 totalArthaEarned, uint256 totalArthaClaimed);
 
     function globalBooks()
         external
@@ -88,20 +74,19 @@ interface IUserRewardVault {
         returns (
             uint256 arthaMinted,
             uint256 arthaClaimed,
-            uint256 outstandingArtha,
+            uint256 outstanding,
             uint256 arthaLeftInBudget,
-            uint256 usdEarned,
-            uint256 usdClaimed
+            uint256 arthaBalance
         );
 
-    function arthaIssuedPerVault() external view returns (address[] memory vaults, uint256[] memory issued);
+    function userTotalArthaClaimed(address user) external view returns (uint256);
+    function registeredVaultsCount() external view returns (uint256);
 
-    // ── admin ──
+    // ── admin (timelock) ──
 
-    function registerVault(address vault, address shareToken, uint8 decimals, uint256 rateBps, uint256 arthaRatio)
-        external;
-    function setRewardRate(address vault, uint256 rateBps) external;
-    function setArthaRatio(address vault, uint256 arthaRatio) external;
-    function setOracle(address newOracle) external;
+    /// @param rewardRate_ ARTHA per share per second, 1e18 fixed point.
+    function registerVault(address vault, address shareToken, uint256 rewardRate_) external;
+
+    function setRewardRate(address vault, uint256 rewardRate_) external;
     function rescue(address token, address to, uint256 amount) external;
 }
