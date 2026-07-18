@@ -1,22 +1,23 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {ISwapper} from "../../interfaces/ISwapper.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
-interface ICurvePool {
-    // classic StableSwap signature; `i`,`j` are coin indices
+import {ISwapper} from "../interfaces/ISwapper.sol";
+
+interface ICurvePoolExchange {
     function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy) external returns (uint256);
 }
 
 /**
  * @title  CurveSwapper
- * @notice Swaps via a Curve StableSwap pool — ideal for stable<->stable legs with
- *         low slippage. `data` = abi.encode(address pool, int128 i, int128 j),
- *         identifying the pool and the in/out coin indices for this pair.
+ * @notice ISwapper over a Curve StableSwap pool — the low-slippage route for
+ *         stable<->stable legs (and reward tokens that pair well on Curve).
  *
- *  Pulls tokenIn, exchanges, sends tokenOut back to the caller (the Diamond).
+ *   data = abi.encode(address pool, int128 i, int128 j)
+ *   flow : pull tokenIn from the caller (the strategy) -> exchange -> return tokenOut.
+ *          `minOut` is the strategy's ORACLE-derived floor, enforced here too.
  */
 contract CurveSwapper is ISwapper {
     using SafeERC20 for IERC20;
@@ -32,7 +33,7 @@ contract CurveSwapper is ISwapper {
         IERC20(tokenIn).forceApprove(pool, amountIn);
 
         uint256 balBefore = IERC20(tokenOut).balanceOf(address(this));
-        ICurvePool(pool).exchange(i, j, amountIn, minOut);
+        ICurvePoolExchange(pool).exchange(i, j, amountIn, minOut);
         amountOut = IERC20(tokenOut).balanceOf(address(this)) - balBefore;
 
         require(amountOut >= minOut, "MIN_OUT");
