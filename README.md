@@ -1,9 +1,62 @@
-# Artha Protocol — v4 Architecture
+# Artha Protocol
 
-> **Status:** design specification. Supersedes v3.
-> **What changed from v3:** eleven structural changes, listed in §0. The biggest:
-> **the PositionManager is deleted.** Each vault is its own ERC-721. Users call the
-> vault directly. Everything else follows from that.
+> **Status:** implemented. `contracts/src/facets/`, `contracts/src/libraries/`,
+> `contracts/src/strategies/`, `contracts/src/oracle/`, `contracts/src/rewards/`,
+> `contracts/src/referral/`, and `contracts/src/governance/` are built. Deploy
+> scripts and the test suite are the next phase, not yet written.
+>
+> **Start here:** [`docs/architecture.md`](../docs/architecture.md) (system layout,
+> facet map, access control) and [`docs/formulas.md`](../docs/formulas.md) (every
+> formula — NAV, share math, fees, caps — with worked numeric examples). Per-facet
+> detail lives in [`docs/facets/`](../docs/facets/), per-strategy detail in
+> [`docs/strategies/`](../docs/strategies/).
+>
+> ---
+>
+> ## ⚠ Parts I–III below (§0–§12) describe an EARLIER, SUPERSEDED design
+>
+> Everything from here through the end of §12 (just before "PART IV —
+> STRATEGIES") documents a design that was never built: vaults as ERC-721
+> positions, per-position cost-basis accounting, an entry-fee + profit-fee model,
+> and an end-of-day batch-deploy flow explicitly different from Yearn's real one.
+> It is kept below as historical design-reasoning context, not as a description of
+> the current codebase.
+>
+> **What was actually built instead**, in one paragraph: one Diamond serves an
+> arbitrary number of vaults, each identified by its own `VaultShareToken` — a
+> plain, transferable ERC-20 (fungible shares, not ERC-721 positions; this is what
+> lets `UserRewardVault` stake vault shares with a bare `transferFrom`, no special
+> integration). Deposits mint shares immediately against a checkpointed NAV and
+> sit as idle balance until the keeper's `deployIdle`/`rebalance` call actually
+> deploys them — Yearn's real production model (Model A), not the batched
+> alternative these sections describe. Each vault holds up to 5 strategies plus an
+> admin-set 0–10% idle buffer, priced by `idle + Σ strategy.totalAssets()` (each
+> strategy already folds in oracle-converted position value and haircut pending
+> rewards — see `docs/strategies/00-base-strategy.md`). The fee is ONE vault-wide
+> aggregate high-water-mark performance fee, realized by minting shares to the
+> treasury, never a per-position entry/profit fee pair. Full detail, with worked
+> arithmetic for every one of these, is in `docs/formulas.md`.
+>
+> **Part IV (§13–§16, strategies) and Part V (§17–§20, rewards + referral) DO**
+> describe the current system and remain accurate — nothing there changed.
+>
+> **Part VI (§21–§25, operations) is ALSO superseded**, for the same reason as
+> Parts I–III: §21–§22's "super admin can only touch strategies while a
+> protocol-wide `emergency` flag freezes every user's deposit/withdraw" model was
+> never built. What exists instead (`VaultAdminFacet` + `VaultEmergencyFacet`, see
+> `docs/architecture.md` §5 and `docs/facets/VaultEmergencyFacet.md`): a guardian
+> can pause a vault (or the whole protocol) instantly, but can **never** unpause —
+> only governance (the timelock, via a full public proposal) can. Strategy changes
+> (`addStrategy`/`removeStrategy`/`setTargets`/`migrateStrategy`) are `onlyGovernance`
+> at all times, not gated behind a declared emergency — the timelock's own public
+> delay window is the front-running defense, not a separate freeze mechanism.
+> Withdrawals are NEVER fully frozen: a paused vault blocks the *normal*
+> `withdraw`/`redeem` path, but `emergencyWithdraw` remains open to everyone,
+> always, and never reverts on a liquidity shortfall. §21's "keeper cannot add/
+> remove a strategy" and "worst case if the keeper key is stolen" reasoning
+> **does** still hold for the implemented `VaultHarvestFacet` (harvest/deployIdle/
+> rebalance only, same bounded blast radius) — only the super-admin/emergency-gate
+> mechanics in §22 (and the worked walkthroughs in §23 that assume it) differ.
 
 ---
 
