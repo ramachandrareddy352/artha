@@ -33,7 +33,7 @@ import {IDiamondCut} from "./interfaces/IDiamondCut.sol";
  *      that integrate against it) ever needs to update anything.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   DEPLOYMENT ORDER (see script/, written later)
+ *   DEPLOYMENT ORDER 
  *  ═══════════════════════════════════════════════════════════════════════════
  *
  *   1. Deploy DiamondCutFacet (no constructor args — it only calls LibDiamond).

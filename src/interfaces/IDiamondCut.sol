@@ -18,14 +18,14 @@ interface IDiamondCut {
         Add,
         Replace,
         Remove
-    }
+    } 
 
     struct FacetCut {
         address facetAddress;
         FacetCutAction action;
         bytes4[] functionSelectors;
     }
-
+ 
     /// @notice Apply a batch of facet changes, then optionally delegatecall `_init`
     ///         with `_calldata` (e.g. to seed new storage fields the new facets need).
     ///         Pass `_init = address(0)` to skip initialization.

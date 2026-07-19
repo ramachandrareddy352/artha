@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {LibDiamond} from "../libraries/LibDiamond.sol";
 import {IDiamondCut} from "../interfaces/IDiamondCut.sol";
 
-/**
+/** 
  * @title  DiamondCutFacet
  * @notice The single entry point for upgrading protocol logic. Gated to the
  *         Diamond's `contractOwner` — the ArthaTimelock — so every facet change is a
