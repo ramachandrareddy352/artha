@@ -1,108 +1,128 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {AppStorage, LibAppStorage, BPS_DENOMINATOR, MAX_IDLE_BPS, MAX_STRATEGIES_PER_VAULT} from "./LibAppStorage.sol";
-import {LibVaultNav} from "./LibVaultNav.sol";
+import {VaultStorage, BPS_DENOMINATOR, MAX_IDLE_BPS, MAX_STRATEGIES_PER_VAULT} from "./VaultStorage.sol";
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /**
  * @title  LibStrategyRegistry
- * @notice Add / disable / remove / migrate a vault's strategies, and set target
- *         allocation weights. Every function here is governance-only, called from
- *         VaultAdminFacet — never from a user-facing path.
+ * @notice Add / disable / remove / migrate this vault's strategies, set target
+ *         weights, and perform the low-level invest/divest that moves capital
+ *         between the vault and its (stateless, zero-custody) strategies.
+ *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   RECEIPTS LIVE IN THE VAULT
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *   invest : the vault approves `amount` of base to the strategy; the strategy
+ *            pulls it and deposits into the venue with the receipt credited to
+ *            the vault. `idleBalance` falls, the strategy's tracked value rises.
+ *   divest : the vault grants the strategy transient access to the receipt token;
+ *            the strategy redeems and returns base to the vault. `idleBalance`
+ *            rises, the strategy's tracked value falls.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
  *   THE INVARIANT: harvest-before-reallocate, always
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  Changing what a vault is allocated to (`setTargets`, `removeStrategy`,
- *  `migrateStrategy`) NEVER reprices against stale, un-harvested strategy value.
- *  Every one of these functions harvests every affected strategy FIRST — and if
- *  that harvest reverts (a swap slippage bound not met in current conditions), the
- *  WHOLE reallocation reverts with it. This is deliberate: reallocating against a
- *  NAV that hasn't captured pending yield either overpays or underpays whichever
- *  side of the reallocation is growing, and "just skip the failed harvest and
- *  proceed anyway" would silently mis-price the very users this system exists to
- *  protect. Wait for conditions to improve and retry.
+ *  `removeStrategy` / `migrateStrategy` harvest the affected strategy FIRST and
+ *  hard-revert if that harvest reverts — never reprice against stale value.
  *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   WEIGHTS: sum(strategyWeightBps) + idleTargetBps <= BPS_DENOMINATOR
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  Strictly <=, not ==. Governance may intentionally leave the sum under 100%,
- *  which widens the EFFECTIVE idle buffer beyond `idleTargetBps` for a cautious
- *  period without needing a separate "extra buffer" concept.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   DISABLED vs BROKEN vs REMOVED
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *   disabled : governance-set. Blocks NEW deploys into it (deployIdle/rebalance
- *              skip it), but existing capital stays and it is still withdrawn from
- *              in priority order and still counted in NAV. The lightweight tool for
- *              "stop growing this position" without the gas cost of a full unwind.
- *   broken   : circuit-breaker-set (LibVaultNav), not governance. Same effect as
- *              disabled for new deploys, but signals an AUTOMATIC trip (suspicious
- *              value jump or a reverting read) that governance must investigate
- *              before clearing, vs `disabled` which is a deliberate choice.
- *   removed  : fully unwound (harvested + withdrawn to idle) and dropped from the
- *              vault's strategy list entirely. Irreversible without re-adding.
+ *  WEIGHTS: sum(strategyWeightBps) + idleTargetBps <= BPS_DENOMINATOR (strictly
+ *  <=, so governance may intentionally widen the effective idle buffer).
  */
 library LibStrategyRegistry {
     using SafeERC20 for IERC20;
 
-    event StrategyAdded(address indexed vault, address indexed strategy, uint16 weightBps);
-    event StrategyDisabledSet(address indexed vault, address indexed strategy, bool disabled);
-    event StrategyRemoved(address indexed vault, address indexed strategy, uint256 dustWrittenOff);
-    event StrategyMigrated(address indexed vault, address indexed from, address indexed to, uint256 movedAssets);
-    event TargetsSet(address indexed vault, address[] strategies, uint16[] weightsBps, uint16 idleTargetBps);
-    event StrategyCircuitCleared(address indexed vault, address indexed strategy);
+    event StrategyAdded(address indexed strategy, uint16 weightBps);
+    event StrategyDisabledSet(address indexed strategy, bool disabled);
+    event StrategyRemoved(address indexed strategy, uint256 dustWrittenOff);
+    event StrategyMigrated(address indexed from, address indexed to, uint256 movedAssets);
+    event TargetsSet(address[] strategies, uint16[] weightsBps, uint16 idleTargetBps);
+    event StrategyCircuitCleared(address indexed strategy);
 
-    /// @notice Add a new strategy to a vault and set the FULL target vector in one
-    ///         call (see the header on `setTargets` for why add + reweight is
-    ///         atomic here, unlike a pure reweight which is execution-decoupled).
+    // ─────────────────────────── capital movement ───────────────────────────────
+
+    /// @notice Approve `amount` of base to `strategy` and invest it, crediting the
+    ///         venue receipt to this vault. Updates idle + tracked value.
+    function investInto(address strategy, uint256 amount) internal {
+        if (amount == 0) return;
+        VaultStorage.Layout storage s = VaultStorage.layout();
+
+        IERC20(s.baseAsset).forceApprove(strategy, amount);
+        IStrategy(strategy).invest(amount);
+        IERC20(s.baseAsset).forceApprove(strategy, 0);
+
+        s.idleBalance -= amount;
+        s.strategyLastValue[strategy] += amount;
+    }
+
+    /// @notice Grant `strategy` transient receipt access, divest up to `amount`
+    ///         base back into the vault, and return what was actually freed.
+    ///         Keeps the circuit-breaker cache honest by decrementing tracked value.
+    function divestFrom(address strategy, uint256 amount) internal returns (uint256 freed) {
+        if (amount == 0) return 0;
+        VaultStorage.Layout storage s = VaultStorage.layout();
+
+        address receipt = IStrategy(strategy).receiptToken();
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
+        freed = IStrategy(strategy).divest(amount);
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
+
+        if (freed != 0) {
+            s.idleBalance += freed;
+            uint256 last = s.strategyLastValue[strategy];
+            s.strategyLastValue[strategy] = freed >= last ? 0 : last - freed;
+        }
+    }
+
+    /// @notice Fully unwind a strategy's position to base (emergency path — no
+    ///         harvest, no slippage bound), crediting the proceeds to idle.
+    function fullExit(address strategy) internal returns (uint256 freed) {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+
+        address receipt = IStrategy(strategy).receiptToken();
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
+        freed = IStrategy(strategy).emergencyWithdraw();
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
+
+        if (freed != 0) s.idleBalance += freed;
+        s.strategyLastValue[strategy] = 0;
+    }
+
+    // ─────────────────────────── registry ───────────────────────────────────────
+
     function addStrategy(
-        address vault,
         address strategy,
         address[] memory allStrategies,
         uint16[] memory allWeightsBps,
         uint16 idleTargetBps
     ) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
+        VaultStorage.Layout storage s = VaultStorage.layout();
         require(strategy != address(0), "ZERO_ADDRESS");
         require(IStrategy(strategy).vault() == address(this), "STRATEGY_VAULT_MISMATCH");
-        require(IStrategy(strategy).asset() == IERC20(s.baseAsset[vault]), "STRATEGY_ASSET_MISMATCH");
+        require(IStrategy(strategy).asset() == IERC20(s.baseAsset), "STRATEGY_ASSET_MISMATCH");
 
-        address[] storage list = s.strategies[vault];
+        address[] storage list = s.strategies;
         for (uint256 i; i < list.length; i++) {
             require(list[i] != strategy, "ALREADY_ADDED");
         }
         require(list.length < MAX_STRATEGIES_PER_VAULT, "MAX_STRATEGIES");
 
         list.push(strategy);
-        emit StrategyAdded(vault, strategy, 0);
+        emit StrategyAdded(strategy, 0);
 
-        setTargets(vault, allStrategies, allWeightsBps, idleTargetBps);
+        setTargets(allStrategies, allWeightsBps, idleTargetBps);
     }
 
-    /// @notice Update target weights only. Does NOT move any capital — the next
-    ///         `deployIdle`/`rebalance` call (VaultHarvestFacet) executes toward
-    ///         these targets. Decoupling intent from execution keeps this call
-    ///         cheap and means it can never revert on slippage; it only ever
-    ///         reverts on a bad weight vector.
-    function setTargets(
-        address vault,
-        address[] memory strategies_,
-        uint16[] memory weightsBps,
-        uint16 idleTargetBps
-    ) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
+    function setTargets(address[] memory strategies_, uint16[] memory weightsBps, uint16 idleTargetBps) internal {
+        VaultStorage.Layout storage s = VaultStorage.layout();
         require(strategies_.length == weightsBps.length, "LENGTH_MISMATCH");
         require(idleTargetBps <= MAX_IDLE_BPS, "IDLE_TOO_HIGH");
 
-        address[] storage registered = s.strategies[vault];
+        address[] storage registered = s.strategies;
         require(strategies_.length == registered.length, "MUST_COVER_ALL_STRATEGIES");
 
         uint256 sum = idleTargetBps;
@@ -116,125 +136,107 @@ library LibStrategyRegistry {
             }
             require(found, "UNKNOWN_STRATEGY");
             sum += weightsBps[i];
-            s.strategyWeightBps[vault][strategies_[i]] = weightsBps[i];
+            s.strategyWeightBps[strategies_[i]] = weightsBps[i];
         }
         require(sum <= BPS_DENOMINATOR, "WEIGHTS_EXCEED_100");
 
-        s.idleTargetBps[vault] = idleTargetBps;
-        emit TargetsSet(vault, strategies_, weightsBps, idleTargetBps);
+        s.idleTargetBps = idleTargetBps;
+        emit TargetsSet(strategies_, weightsBps, idleTargetBps);
     }
 
-    /// @notice Blocks new deploys into `strategy` without unwinding it. Existing
-    ///         capital keeps earning and is still counted in NAV and still eligible
-    ///         to be drained on withdrawal.
-    function setDisabled(address vault, address strategy, bool disabled) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
-        require(_isKnown(s, vault, strategy), "UNKNOWN_STRATEGY");
-        s.strategyDisabled[vault][strategy] = disabled;
-        emit StrategyDisabledSet(vault, strategy, disabled);
+    function setDisabled(address strategy, bool disabled) internal {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+        require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
+        s.strategyDisabled[strategy] = disabled;
+        emit StrategyDisabledSet(strategy, disabled);
     }
 
-    /// @notice Governance-reviewed clear of an automatic circuit-break, after
-    ///         confirming the strategy is actually healthy again.
-    function clearCircuitBreak(address vault, address strategy) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
-        require(_isKnown(s, vault, strategy), "UNKNOWN_STRATEGY");
-        s.strategyBroken[vault][strategy] = false;
-        emit StrategyCircuitCleared(vault, strategy);
+    function clearCircuitBreak(address strategy) internal {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+        require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
+        s.strategyBroken[strategy] = false;
+        emit StrategyCircuitCleared(strategy);
     }
 
-    /// @notice Fully unwind and drop a strategy. Harvests, withdraws everything it
-    ///         will give up, and credits the proceeds to the vault's idle balance.
-    ///         Reverts if the harvest reverts (see the header). Any unrecoverable
-    ///         dust below `dustFloor` (venue-rounding remainder that cannot be
-    ///         extracted, e.g. Curve's LP rounding) is written off rather than
-    ///         blocking removal forever.
-    function removeStrategy(address vault, address strategy, uint256 dustFloor) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
-        require(_isKnown(s, vault, strategy), "UNKNOWN_STRATEGY");
+    /// @notice Fully unwind and drop a strategy. Harvests (hard revert on failure
+    ///         unless already broken), unwinds everything to idle, and requires the
+    ///         residual to be <= dustFloor.
+    function removeStrategy(address strategy, uint256 dustFloor) internal {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+        require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
 
-        if (!s.strategyBroken[vault][strategy]) {
+        if (!s.strategyBroken[strategy]) {
             try IStrategy(strategy).harvest() {} catch {
                 revert("HARVEST_FAILED");
             }
         }
 
-        uint256 freed = IStrategy(strategy).emergencyWithdraw();
-        s.idleBalance[vault] += freed;
+        fullExit(strategy);
 
-        uint256 remaining = s.strategyBroken[vault][strategy] ? 0 : IStrategy(strategy).totalAssets();
+        uint256 remaining = s.strategyBroken[strategy] ? 0 : IStrategy(strategy).positionValue();
         uint256 dust = remaining <= dustFloor ? remaining : 0;
         require(remaining == 0 || remaining <= dustFloor, "UNRECOVERABLE_BALANCE");
 
-        _removeFromList(s, vault, strategy);
-        delete s.strategyWeightBps[vault][strategy];
-        delete s.strategyDisabled[vault][strategy];
-        delete s.strategyBroken[vault][strategy];
-        delete s.strategyLastValue[vault][strategy];
+        _removeFromList(s, strategy);
+        delete s.strategyWeightBps[strategy];
+        delete s.strategyDisabled[strategy];
+        delete s.strategyBroken[strategy];
+        delete s.strategyLastValue[strategy];
 
-        emit StrategyRemoved(vault, strategy, dust);
+        emit StrategyRemoved(strategy, dust);
     }
 
-    /// @notice Atomically replace `from` with `to` (e.g. swapping in a fixed
-     ///        version of a buggy strategy) in ONE call, so the capital's target
-     ///        allocation is never left idle between a separate remove and a
-     ///        separate add. Harvests and fully unwinds `from`, deploys the freed
-     ///        base token into `to`, and carries `from`'s target weight over to
-     ///        `to` unchanged.
-    function migrateStrategy(address vault, address from, address to) internal {
-        AppStorage storage s = LibAppStorage.diamondStorage();
-        require(_isKnown(s, vault, from), "UNKNOWN_STRATEGY");
+    /// @notice Atomically replace `from` with `to`, carrying the target weight over.
+    function migrateStrategy(address from, address to) internal {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+        require(_isKnown(s, from), "UNKNOWN_STRATEGY");
         require(to != address(0), "ZERO_ADDRESS");
         require(IStrategy(to).vault() == address(this), "STRATEGY_VAULT_MISMATCH");
-        require(IStrategy(to).asset() == IERC20(s.baseAsset[vault]), "STRATEGY_ASSET_MISMATCH");
+        require(IStrategy(to).asset() == IERC20(s.baseAsset), "STRATEGY_ASSET_MISMATCH");
 
-        address[] storage list = s.strategies[vault];
+        address[] storage list = s.strategies;
         for (uint256 i; i < list.length; i++) {
             require(list[i] != to, "ALREADY_ADDED");
         }
 
-        if (!s.strategyBroken[vault][from]) {
+        if (!s.strategyBroken[from]) {
             try IStrategy(from).harvest() {} catch {
                 revert("HARVEST_FAILED");
             }
         }
-        uint256 freed = IStrategy(from).emergencyWithdraw();
+        uint256 freed = fullExit(from);
 
-        uint16 weight = s.strategyWeightBps[vault][from];
+        uint16 weight = s.strategyWeightBps[from];
 
-        _removeFromList(s, vault, from);
-        delete s.strategyWeightBps[vault][from];
-        delete s.strategyDisabled[vault][from];
-        delete s.strategyBroken[vault][from];
-        delete s.strategyLastValue[vault][from];
+        _removeFromList(s, from);
+        delete s.strategyWeightBps[from];
+        delete s.strategyDisabled[from];
+        delete s.strategyBroken[from];
+        delete s.strategyLastValue[from];
 
         list.push(to);
-        s.strategyWeightBps[vault][to] = weight;
+        s.strategyWeightBps[to] = weight;
 
-        if (freed != 0) {
-            IERC20(s.baseAsset[vault]).forceApprove(to, freed);
-            IStrategy(to).deposit(freed);
-        }
+        if (freed != 0) investInto(to, freed);
 
-        emit StrategyMigrated(vault, from, to, freed);
+        emit StrategyMigrated(from, to, freed);
     }
 
-    function _isKnown(AppStorage storage s, address vault, address strategy) private view returns (bool) {
-        address[] storage list = s.strategies[vault];
+    function _isKnown(VaultStorage.Layout storage s, address strategy) private view returns (bool) {
+        address[] storage list = s.strategies;
         for (uint256 i; i < list.length; i++) {
             if (list[i] == strategy) return true;
         }
         return false;
     }
 
-    function _removeFromList(AppStorage storage s, address vault, address strategy) private {
-        address[] storage list = s.strategies[vault];
+    function _removeFromList(VaultStorage.Layout storage s, address strategy) private {
+        address[] storage list = s.strategies;
         uint256 n = list.length;
         for (uint256 i; i < n; i++) {
             if (list[i] == strategy) {
                 // Preserve priority ORDER for the remaining strategies (a plain
-                // swap-with-last would silently reorder the withdrawal queue) —
-                // shift everything after `i` left by one instead.
+                // swap-with-last would silently reorder the withdrawal queue).
                 for (uint256 j = i; j < n - 1; j++) {
                     list[j] = list[j + 1];
                 }

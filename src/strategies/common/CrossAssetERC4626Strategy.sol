@@ -10,73 +10,46 @@ import {BaseStrategy} from "../BaseStrategy.sol";
 import {IERC4626} from "../interfaces/IERC4626.sol";
 
 /**
- * @title  CrossAssetERC4626Strategy  —  wrap a 4626 whose asset ISN'T the base token
- * @notice The universal wrapper (ERC4626WrapperStrategy) only works when the external
- *         vault's asset() equals our base token. Most yield-bearing tokens do NOT:
+ * @title  CrossAssetERC4626Strategy — wrap a 4626 whose asset ISN'T the base token
+ * @notice base <-> intermediate (the 4626's asset) via the swapper, on both entry
+ *         and exit; the 4626 shares are held IN THE ARTHA VAULT.
  *
- *      sUSDe  (Ethena)  -> asset USDe
- *      sFRAX  (Frax)    -> asset FRAX
- *      sUSDS  (Sky)     -> asset USDS
- *      wOUSD  (Origin)  -> asset OUSD
- *      sfrxETH(Frax)    -> asset frxETH
+ *   invest   : base -> swap -> intermediate -> target.deposit(int, VAULT)  (shares to vault)
+ *   value    : target.convertToAssets(target.balanceOf(VAULT)) -> oracle-converted to base
+ *   divest   : target.withdraw(int, this, VAULT) -> swap intermediate -> base (to strategy)
+ *   harvest  : NO-OP (yield is the 4626 share price rising)
  *
- *  To hold any of these from a USDC / DAI / WETH vault, this strategy adds a SWAP LEG:
- *  base <-> intermediate (the 4626's asset) via the swapper, on both entry and exit.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   HOW WE INVEST / WITHDRAW
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *   invest   : swapper.swap(base -> intermediate)  then  target.deposit(intermediate)
- *   value    : target.convertToAssets(shares) = intermediate amount, then oracle-
- *              converted to base-token units (both are ~$1 stables, oracle handles
- *              the small delta).
- *   withdraw : target.withdraw(intermediate)  then  swapper.swap(intermediate -> base)
- *   harvest  : NO-OP — the underlying yield is the 4626 share price rising (Shape 2).
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   THE RISK THIS ADDS OVER A PLAIN WRAPPER
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  Two extra exposures the same-asset wrapper does not have:
- *   1. PEG — NAV values the position in base via the oracle; if the intermediate
- *      stable depegs, reported value and realizable value diverge until it re-pegs.
- *   2. SWAP SLIPPAGE — every deposit and withdrawal crosses the swapper, so each
- *      round-trip pays spread + slippage (bounded by maxSlippageBps). This makes the
- *      strategy best for LONGER holds, not rapid in/out.
- *
- *  For sUSDe specifically this is the README's "wrap it, never build the hedge" —
- *  we take Ethena's funding yield by holding sUSDe, and never run the perp hedge
- *  ourselves.
+ *  RISK: peg (oracle vs realizable value) + swap slippage on every round-trip.
  */
 contract CrossAssetERC4626Strategy is BaseStrategy {
     using SafeERC20 for IERC20;
 
-    /// @notice The 4626's underlying (what we must swap base into). e.g. USDe.
     IERC20 public immutable intermediate;
     uint8 public immutable intermediateDecimals;
-    /// @notice The external yield-bearing 4626 (e.g. sUSDe).
     IERC4626 public immutable target;
 
-    /// @notice buyRoute: base -> intermediate. sellRoute: intermediate -> base.
-    bytes public buyRoute;
-    bytes public sellRoute;
+    bytes public buyRoute; // base -> intermediate
+    bytes public sellRoute; // intermediate -> base
 
     event RoutesSet();
 
     constructor(
         address _vault,
-        address _asset, // base token (USDC / DAI / WETH ...)
+        address _asset,
         address _oracle,
         address _swapper,
-        address _target, // the 4626 (sUSDe / sFRAX / sUSDS / wOUSD ...)
-        address _intermediate // the 4626's asset (USDe / FRAX / USDS / OUSD ...)
+        address _target,
+        address _intermediate
     ) BaseStrategy(_vault, _asset, _oracle, _swapper) {
         require(_target != address(0) && _intermediate != address(0), "ZERO_ADDR");
         require(IERC4626(_target).asset() == _intermediate, "ASSET_MISMATCH");
         target = IERC4626(_target);
         intermediate = IERC20(_intermediate);
         intermediateDecimals = IERC20Metadata(_intermediate).decimals();
+    }
+
+    function receiptToken() public view override returns (address) {
+        return address(target);
     }
 
     // ─────────────────────────── invest / divest ────────────────────────────────
@@ -87,48 +60,47 @@ contract CrossAssetERC4626Strategy is BaseStrategy {
         uint256 intOut = swapper.swap(address(asset), address(intermediate), amount, minInt, buyRoute);
 
         intermediate.forceApprove(address(target), intOut);
-        target.deposit(intOut, address(this));
+        target.deposit(intOut, vault); // shares credited to the vault
     }
 
-    function _divest(uint256 amount) internal override returns (uint256 freed) {
+    function _divest(uint256 amount) internal override {
         uint256 intNeeded = _baseToIntermediate(amount);
-        uint256 redeemable = target.maxWithdraw(address(this));
+        uint256 redeemable = target.maxWithdraw(vault);
         if (intNeeded > redeemable) intNeeded = redeemable;
-        if (intNeeded == 0) return 0;
+        if (intNeeded == 0) return;
 
-        target.withdraw(intNeeded, address(this), address(this));
-        return _sellIntermediate(intNeeded);
+        // intermediate to this strategy; burns the vault's shares via granted allowance.
+        target.withdraw(intNeeded, address(this), vault);
+        _sellIntermediate(intNeeded);
     }
 
-    function _withdrawAll() internal override returns (uint256 freed) {
-        uint256 shares = target.balanceOf(address(this));
-        if (shares == 0) return 0;
-        uint256 intOut = target.redeem(shares, address(this), address(this));
-        return _sellIntermediate(intOut);
+    function _withdrawAll() internal override {
+        uint256 shares = target.balanceOf(vault);
+        if (shares == 0) return;
+        uint256 intOut = target.redeem(shares, address(this), vault);
+        _sellIntermediate(intOut);
     }
 
-    function _sellIntermediate(uint256 intAmount) internal returns (uint256 freed) {
+    function _sellIntermediate(uint256 intAmount) internal {
+        if (intAmount == 0) return;
         uint256 minBase = (_intermediateToBase(intAmount) * (10_000 - maxSlippageBps)) / 10_000;
         intermediate.forceApprove(address(swapper), intAmount);
-        uint256 before = asset.balanceOf(address(this));
-        swapper.swap(address(intermediate), address(asset), intAmount, minBase, sellRoute);
-        freed = asset.balanceOf(address(this)) - before;
+        swapper.swap(address(intermediate), address(asset), intAmount, minBase, sellRoute); // base to this strategy
     }
 
     // ─────────────────────────────── value ──────────────────────────────────────
 
     function _positionValue() internal view override returns (uint256) {
-        uint256 intAmount = target.convertToAssets(target.balanceOf(address(this)));
+        uint256 intAmount = target.convertToAssets(target.balanceOf(vault));
         return _intermediateToBase(intAmount);
     }
 
     function maxWithdraw() external view override returns (uint256) {
-        return _intermediateToBase(target.maxWithdraw(address(this)));
+        return _intermediateToBase(target.maxWithdraw(vault));
     }
 
     // ───────────────────────── oracle conversions ───────────────────────────────
 
-    /// @dev intermediate units -> base units, via oracle USD prices (both 8dp).
     function _intermediateToBase(uint256 intAmount) internal view returns (uint256) {
         if (intAmount == 0) return 0;
         uint256 pInt = oracle.getPrice(address(intermediate));
@@ -137,7 +109,6 @@ contract CrossAssetERC4626Strategy is BaseStrategy {
         return Math.mulDiv(intAmount, pInt * (10 ** assetDecimals), pBase * (10 ** intermediateDecimals));
     }
 
-    /// @dev base units -> intermediate units.
     function _baseToIntermediate(uint256 baseAmount) internal view returns (uint256) {
         if (baseAmount == 0) return 0;
         uint256 pInt = oracle.getPrice(address(intermediate));

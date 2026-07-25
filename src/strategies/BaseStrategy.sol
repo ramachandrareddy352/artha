@@ -12,80 +12,54 @@ import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {ISwapper} from "./interfaces/ISwapper.sol";
 
 /**
- * @title  BaseStrategy
- * @notice The shared skeleton every Artha strategy inherits. It fixes the lifecycle
- *         (deposit / withdraw / harvest / value) and the safety rules once, so a
- *         concrete strategy only fills in the four protocol-specific hooks.
+ * @title  BaseStrategy — stateless executor
+ * @notice The shared skeleton every Artha strategy inherits. A strategy
+ *         CUSTODIES NOTHING: every venue receipt is credited to the VAULT, and
+ *         every redemption returns base token to the VAULT. Base token only ever
+ *         passes through the strategy transiently within a single call.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   ONE STRATEGY = ONE COMPOSITION, HOWEVER MANY PROTOCOLS IT TOUCHES
+ *   THE FOUR HOOKS (a concrete strategy fills these in)
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  A strategy is one address the vault treats as a black box. Inside it may chain
- *  several protocols — e.g. deposit USDC to Curve, stake the LP in Convex, sell CRV
- *  and CVX, redeposit — but the vault only ever sees `deposit / withdraw / harvest /
- *  totalAssets`. That is why "invest in Curve then stake in Convex for extra yield"
- *  is ONE strategy slot, not two: the second protocol is an internal implementation
- *  detail hidden behind these hooks.
+ *   _invest(amount)      : base is already in THIS strategy (pulled from the
+ *                          vault by `invest`); deposit it into the venue with the
+ *                          receipt credited to the VAULT (onBehalfOf/receiver=vault).
+ *   _divest(amount)      : redeem up to `amount` base from the vault's venue
+ *                          position, delivering the base into THIS strategy (the
+ *                          base wrapper forwards it to the vault).
+ *   _withdrawAll()       : unwind the vault's entire position to base into THIS
+ *                          strategy (the wrapper forwards to the vault).
+ *   _positionValue()     : value of the VAULT's venue position, in base.
+ *
+ *  Optional: `_pendingRewardsValue`, `_harvestRewards`, `receiptToken`.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   VAULT-ONLY. NO KEEPER CAN FORCE A TINY HARVEST.
+ *   VAULT-ONLY. RECEIPTS IN THE VAULT.
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  Every money-moving function is `onlyVault`. Harvest especially: reward-selling
- *  costs gas and eats slippage, so harvesting a trivial amount is a net loss. Gating
- *  it to the vault means only the vault's own keeper flow — which decides WHEN it is
- *  economic — can trigger it. No third party can grief the position with dust harvests.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   VALUE = POSITION + PENDING REWARDS (counted continuously)
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *      totalAssets = _positionValue() + _pendingRewardsValue()
- *
- *  Unclaimed reward tokens are counted into `totalAssets` AS THEY ACCRUE, valued via
- *  the oracle at a haircut. This is the anti-front-running rule: because pending
- *  rewards are already in the share price, the actual `harvest()` that realizes them
- *  is a price-per-share no-op — there is no reward "spike" for a depositor to jump in
- *  front of. (README §8.) When a venue makes pending rewards impossible to read in a
- *  view, a strategy under-reports them (returns less) rather than over-reports —
- *  under-reporting can never be gamed for profit.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   WHERE THE COMPOUNDED YIELD GOES (no new shares!)
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  `harvest()` claims rewards, swaps them to base, and reinvests via `_invest`. That
- *  raises `_positionValue` while the vault's share count is unchanged, so every
- *  holder's share simply becomes worth more. Reinvested yield NEVER mints shares —
- *  only a genuine outside deposit does.
+ *  Every money-moving function is `onlyVault`. To divest, the vault grants this
+ *  strategy transient access to the receipt token (an ERC-20 approval, done by
+ *  `LibStrategyRegistry.divestFrom`), which `_divest`/`_withdrawAll` consume.
  */
 abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /// @notice The base token (USDC, WETH, ...). Immutable per strategy.
     IERC20 public immutable override asset;
-    /// @notice Cached decimals of `asset`, for reward valuation math.
     uint8 public immutable assetDecimals;
-    /// @notice The Diamond. The only caller of every state-changing function.
+    /// @notice The vault this strategy serves — the only caller and the custodian.
     address public immutable override vault;
-    /// @notice USD price feed (8dp) for valuing reward tokens and deriving swap floors.
     IPriceOracle public immutable oracle;
-    /// @notice Reward-selling execution venue.
     ISwapper public immutable swapper;
 
-    /// @notice Discount applied to unclaimed-reward value in `totalAssets`. Rewards are
-    ///         worth less than face until sold: slippage, oracle lag, timing. Always
-    ///         under-report. 200 = 2%.
+    /// @notice Discount applied to unclaimed-reward value in `positionValue`. 200 = 2%.
     uint256 public constant REWARD_HAIRCUT_BPS = 200;
 
-    /// @notice Max slippage strategies allow on their own LP/swap legs. Vault-settable,
-    ///         hard-capped so a compromised setter cannot open the door to a full drain.
     uint256 public maxSlippageBps = 100; // 1%
     uint256 public constant MAX_SLIPPAGE_BPS = 500; // 5% ceiling
 
-    event Deposited(uint256 assets);
-    event Withdrawn(uint256 assets);
+    event Invested(uint256 assets);
+    event Divested(uint256 assets);
     event Harvested(uint256 realized);
     event EmergencyWithdrawn(uint256 assets);
     event MaxSlippageSet(uint256 bps);
@@ -106,67 +80,68 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
 
     // ─────────────────────── protocol hooks (override) ──────────────────────────
 
-    /// @dev Deploy `amount` of base token already held by this contract into the venue.
+    /// @dev Deploy `amount` of base (already in this strategy) into the venue,
+    ///      crediting the receipt to the VAULT.
     function _invest(uint256 amount) internal virtual;
 
-    /// @dev Free up to `amount` of base token from the venue back into this contract.
-    ///      Returns the amount actually freed (never more than requested).
-    function _divest(uint256 amount) internal virtual returns (uint256 freed);
+    /// @dev Free up to `amount` of base from the vault's venue position INTO this
+    ///      strategy (the wrapper forwards it to the vault).
+    function _divest(uint256 amount) internal virtual;
 
-    /// @dev Current venue position, valued in base token (principal + accrued interest).
+    /// @dev Current venue position (owned by the vault), valued in base token.
     function _positionValue() internal view virtual returns (uint256);
 
-    /// @dev Base-token value of unclaimed rewards, oracle-priced and haircut. 0 by
-    ///      default (interest/appreciation strategies have no reward token).
+    /// @dev Base value of unclaimed rewards, oracle-priced and haircut. 0 default.
     function _pendingRewardsValue() internal view virtual returns (uint256) {
         return 0;
     }
 
-    /// @dev Claim reward tokens and swap them to base. Returns base realized. Does NOT
-    ///      reinvest — the base wrapper does that. 0 by default.
-    function _harvestRewards() internal virtual returns (uint256 realized) {
-        return 0;
-    }
+    /// @dev Claim rewards and swap them to base INTO this strategy. 0 default.
+    function _harvestRewards() internal virtual {}
 
-    /// @dev Unwind the entire venue position to base token. Default: divest the whole
-    ///      valued position. Override where the venue needs an exact "withdraw all".
-    function _withdrawAll() internal virtual returns (uint256 freed) {
-        return _divest(_positionValue());
-    }
+    /// @dev Unwind the vault's entire venue position to base INTO this strategy.
+    function _withdrawAll() internal virtual;
+
+    /// @inheritdoc IStrategy
+    function receiptToken() public view virtual override returns (address);
 
     // ─────────────────────────── vault actions ──────────────────────────────────
 
-    function deposit(uint256 assets) external override onlyVault nonReentrant {
+    function invest(uint256 assets) external override onlyVault nonReentrant {
         require(assets != 0, "ZERO");
         asset.safeTransferFrom(vault, address(this), assets);
         _invest(assets);
-        emit Deposited(assets);
+        emit Invested(assets);
     }
 
-    function withdraw(uint256 assets) external override onlyVault nonReentrant returns (uint256 withdrawn) {
+    function divest(uint256 assets) external override onlyVault nonReentrant returns (uint256 withdrawn) {
         require(assets != 0, "ZERO");
-        withdrawn = _divest(assets);
+        uint256 before = asset.balanceOf(address(this));
+        _divest(assets);
+        withdrawn = asset.balanceOf(address(this)) - before;
         if (withdrawn != 0) asset.safeTransfer(vault, withdrawn);
-        emit Withdrawn(withdrawn);
+        emit Divested(withdrawn);
     }
 
     function harvest() external override onlyVault nonReentrant returns (uint256 realized) {
-        realized = _harvestRewards();
-        if (realized != 0) _invest(realized);
+        uint256 before = asset.balanceOf(address(this));
+        _harvestRewards();
+        realized = asset.balanceOf(address(this)) - before;
+        if (realized != 0) asset.safeTransfer(vault, realized);
         emit Harvested(realized);
     }
 
     function emergencyWithdraw() external override onlyVault nonReentrant returns (uint256 withdrawn) {
-        withdrawn = _withdrawAll();
-        uint256 bal = asset.balanceOf(address(this));
-        if (bal != 0) asset.safeTransfer(vault, bal);
-        emit EmergencyWithdrawn(bal);
-        return bal;
+        uint256 before = asset.balanceOf(address(this));
+        _withdrawAll();
+        withdrawn = asset.balanceOf(address(this)) - before;
+        if (withdrawn != 0) asset.safeTransfer(vault, withdrawn);
+        emit EmergencyWithdrawn(withdrawn);
     }
 
     // ─────────────────────────────── views ──────────────────────────────────────
 
-    function totalAssets() public view override returns (uint256) {
+    function positionValue() public view override returns (uint256) {
         return _positionValue() + _pendingRewardsValue();
     }
 
@@ -185,8 +160,7 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
     // ────────────────────────────── internal ────────────────────────────────────
 
     /// @dev Value `rewardAmount` of `rewardToken` in base-token units, oracle-priced
-    ///      and haircut. Used both by `_pendingRewardsValue` (view) and to derive a
-    ///      swap `minOut` at harvest.
+    ///      and haircut. Used to derive a swap `minOut` at harvest.
     function _valueInAsset(address rewardToken, uint256 rewardAmount, uint8 rewardDecimals)
         internal
         view
@@ -197,8 +171,6 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         uint256 assetPrice = oracle.getPrice(address(asset)); // 8dp USD
         if (rewardPrice == 0 || assetPrice == 0) return 0;
 
-        // assetUnits = rewardAmount * rewardPrice * 10^assetDecimals
-        //            / (assetPrice * 10^rewardDecimals)
         uint256 gross = Math.mulDiv(
             rewardAmount, rewardPrice * (10 ** assetDecimals), assetPrice * (10 ** rewardDecimals)
         );

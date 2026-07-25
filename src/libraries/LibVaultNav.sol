@@ -1,124 +1,118 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {AppStorage, LibAppStorage, BPS_DENOMINATOR} from "./LibAppStorage.sol";
+import {VaultStorage, BPS_DENOMINATOR} from "./VaultStorage.sol";
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {LibVaultFee} from "./LibVaultFee.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
 /**
  * @title  LibVaultNav
- * @notice Computes and checkpoints a vault's total value: idle base token held by
- *         the Diamond, plus every active strategy's own `totalAssets()` (which
- *         already folds in that strategy's position value AND haircut-adjusted
- *         pending rewards, oracle-converted to base token where the strategy's
- *         venue isn't base-denominated — see BaseStrategy's header).
+ * @notice Computes and checkpoints THIS vault's total value from what the vault
+ *         actually holds:
  *
- *      navCheckpoint[vault] = idleBalance[vault] + sum(strategy.totalAssets())
- *                             over every NOT-broken, NOT-disabled strategy
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   WHY CHECKPOINTED, NOT LIVE
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  A naive design re-reads every strategy's `totalAssets()` on every balance check,
- *  every preview, every transfer-adjacent read. With up to 5 strategies per vault
- *  that is 5 external view calls just to answer "what is my balance worth" — a gas
- *  and griefing problem, and it means a single broken strategy (a stale oracle, a
- *  paused external protocol) can brick reads across every OTHER healthy strategy in
- *  the same vault. Instead, `navCheckpoint` is refreshed explicitly by
- *  `refreshNav()` at the start of every state-changing action (deposit, withdraw,
- *  harvest, settle) and simply READ by everything else (previews, balance display,
- *  the high-water-mark comparison).
+ *      navCheckpoint = idleBalance
+ *                    + Σ strategy.positionValue()   (each strategy reads the
+ *                                                     VAULT's own venue holdings)
+ *                    over every NOT-broken strategy, with broken strategies
+ *                    frozen at their last known-good value.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   A BROKEN STRATEGY NEVER BLOCKS THE VAULT
+ *   TOTAL LIQUIDITY = WHAT THE VAULT CONTAINS
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  `refreshNav` wraps each strategy's `totalAssets()` call so a revert (broken
- *  oracle, paused venue) or a suspicious value jump trips that strategy's
- *  `strategyBroken` flag and falls back to its LAST KNOWN GOOD value instead of
- *  reverting the whole vault's NAV. A vault where one bad integration can freeze
- *  every user's deposits and withdrawals in every OTHER strategy is a worse outcome
- *  than temporarily pricing one position off slightly stale data. Once broken, a
- *  strategy is excluded from new allocation (see LibStrategyRegistry) until
- *  governance clears the flag after investigating.
+ *  Because every DeFi receipt lives in the vault (not in a strategy), a
+ *  strategy's `positionValue()` is a read of the vault's OWN holdings at the
+ *  venue. NAV is therefore grounded in real custody, not a hand-maintained
+ *  ledger that can silently drift from it.
+ *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   SYNC — DIRECT TRANSFERS ("EXTRA") ARE FOLDED IN
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  Base token sent straight to the vault (bypassing deposit) is not tracked as
+ *  idle until `sync()` reconciles the ledger against the real balance and credits
+ *  the surplus. Receipt tokens donated to the vault are already reflected the next
+ *  time NAV is refreshed, since `positionValue()` reads the vault's live holdings.
+ *  Either way a donation only ever lifts existing holders' share value.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
  *   THE CIRCUIT BREAKER
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  `strategyMaxDeltaBps[vault]` bounds how much a strategy's reported value may
- *  move between two consecutive `refreshNav` calls (up OR down) before it is
- *  treated as suspicious rather than trusted. This is the main defense against a
- *  manipulated oracle or a compromised strategy feeding the vault an inflated NAV
- *  to mint itself cheap shares, or a deflated NAV to redeem shares for more than
- *  they are worth. A LEGITIMATE strategy's value moves gradually (interest accrual,
- *  slow reward accumulation) — a jump past the threshold in one block is the
- *  signature of manipulation, not yield.
+ *  `strategyMaxDeltaBps` bounds how much a strategy's reported value may move
+ *  between two consecutive refreshes before it is treated as suspicious rather
+ *  than trusted. A jump past the threshold trips `strategyBroken` and falls back
+ *  to the last known-good value instead of trusting a manipulated read.
  */
 library LibVaultNav {
-    event StrategyValueRefreshed(address indexed vault, address indexed strategy, uint256 value);
-    event StrategyCircuitBroken(address indexed vault, address indexed strategy, uint256 lastValue, uint256 attemptedValue);
-    event StrategyReadReverted(address indexed vault, address indexed strategy);
-    event NavRefreshed(address indexed vault, uint256 totalAssets);
+    event StrategyValueRefreshed(address indexed strategy, uint256 value);
+    event StrategyCircuitBroken(address indexed strategy, uint256 lastValue, uint256 attemptedValue);
+    event StrategyReadReverted(address indexed strategy);
+    event NavRefreshed(uint256 totalAssets);
+    event Synced(uint256 creditedExtra, uint256 idleAfter);
 
-    /// @notice Recompute and store `navCheckpoint[vault]`. Call this FIRST in every
+    /// @notice Reconcile the idle ledger against the vault's real base balance,
+    ///         crediting any un-tracked surplus (a direct donation) into idle.
+    ///         Permissionless-safe: it can only ever increase idle by real,
+    ///         already-received tokens, never move value out.
+    function sync() internal returns (uint256 creditedExtra) {
+        VaultStorage.Layout storage s = VaultStorage.layout();
+        uint256 actualBase = IERC20(s.baseAsset).balanceOf(address(this));
+        if (actualBase > s.idleBalance) {
+            creditedExtra = actualBase - s.idleBalance;
+            s.idleBalance = actualBase;
+        }
+        emit Synced(creditedExtra, s.idleBalance);
+    }
+
+    /// @notice Recompute and store `navCheckpoint`. Call this FIRST in every
     ///         state-changing vault entry point, before any share-math conversion.
-    function refreshNav(address vault) internal returns (uint256 totalAssets) {
-        AppStorage storage s = LibAppStorage.diamondStorage();
+    function refreshNav() internal returns (uint256 totalAssets) {
+        VaultStorage.Layout storage s = VaultStorage.layout();
 
-        totalAssets = s.idleBalance[vault];
+        totalAssets = s.idleBalance;
 
-        address[] storage strats = s.strategies[vault];
+        address[] storage strats = s.strategies;
         uint256 n = strats.length;
         for (uint256 i; i < n; i++) {
             address strat = strats[i];
-            if (s.strategyBroken[vault][strat]) {
-                // Excluded from new deploys, but its last known-good value still
-                // counts toward NAV — funds parked there are still real value,
-                // even while allocation into/out of it is frozen pending review.
-                totalAssets += s.strategyLastValue[vault][strat];
+            if (s.strategyBroken[strat]) {
+                totalAssets += s.strategyLastValue[strat];
                 continue;
             }
 
-            try IStrategy(strat).totalAssets() returns (uint256 newValue) {
-                uint256 lastValue = s.strategyLastValue[vault][strat];
+            try IStrategy(strat).positionValue() returns (uint256 newValue) {
+                uint256 lastValue = s.strategyLastValue[strat];
 
-                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps[vault])) {
-                    s.strategyBroken[vault][strat] = true;
-                    emit StrategyCircuitBroken(vault, strat, lastValue, newValue);
+                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps)) {
+                    s.strategyBroken[strat] = true;
+                    emit StrategyCircuitBroken(strat, lastValue, newValue);
                     totalAssets += lastValue;
                     continue;
                 }
 
-                s.strategyLastValue[vault][strat] = newValue;
-                emit StrategyValueRefreshed(vault, strat, newValue);
+                s.strategyLastValue[strat] = newValue;
+                emit StrategyValueRefreshed(strat, newValue);
                 totalAssets += newValue;
             } catch {
-                emit StrategyReadReverted(vault, strat);
-                totalAssets += s.strategyLastValue[vault][strat];
+                emit StrategyReadReverted(strat);
+                totalAssets += s.strategyLastValue[strat];
             }
         }
 
-        s.navCheckpoint[vault] = totalAssets;
-        emit NavRefreshed(vault, totalAssets);
+        s.navCheckpoint = totalAssets;
+        emit NavRefreshed(totalAssets);
 
-        // Runs on EVERY refresh, not only at an explicit harvest — see
-        // LibVaultFee's header for why price-per-share growth from pure interest
-        // accrual (no harvest event at all) must still be caught here.
-        LibVaultFee.chargePerformanceFee(vault);
+        // Runs on EVERY refresh — see LibVaultFee for why price-per-share growth
+        // from pure interest accrual (no harvest event) must still be caught here.
+        LibVaultFee.chargePerformanceFee();
     }
 
-    /// @dev First-ever read of a strategy (lastValue == 0, e.g. right after it was
-    ///      added) is never flagged — there is nothing to compare against yet, and
-    ///      a genuinely empty new strategy legitimately reads 0.
-    ///
-    ///      Deliberately fail-SAFE, not fail-open, on `maxDeltaBps`: governance
-    ///      input validation (VaultAdminFacet) rejects 0 outright, so this should
-    ///      never see it in practice — but if it ever did, treating 0 as "zero
-    ///      tolerance, trip on any change" is the safe failure mode. A silent
-    ///      "0 == breaker disabled" bypass is exactly the kind of accidental
-    ///      fail-open default this breaker exists to prevent elsewhere.
+    /// @dev First-ever read of a strategy (lastValue == 0) is never flagged.
+    ///      Fail-SAFE on maxDeltaBps == 0: treat as "trip on any change" rather
+    ///      than a silent "breaker disabled" (governance input validation rejects
+    ///      0 anyway, so this should never be seen in practice).
     function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps) private pure returns (bool) {
         if (lastValue == 0) return false;
         uint256 diff = newValue > lastValue ? newValue - lastValue : lastValue - newValue;
@@ -126,10 +120,8 @@ library LibVaultNav {
         return diff > limit;
     }
 
-    /// @notice Read-only view of the last checkpoint, no refresh. Used by previews
-    ///         and balance displays that intentionally price against the last
-    ///         settled state rather than paying for a live strategy sweep.
-    function cachedTotalAssets(address vault) internal view returns (uint256) {
-        return LibAppStorage.diamondStorage().navCheckpoint[vault];
+    /// @notice Read-only view of the last checkpoint, no refresh.
+    function cachedTotalAssets() internal view returns (uint256) {
+        return VaultStorage.layout().navCheckpoint;
     }
 }

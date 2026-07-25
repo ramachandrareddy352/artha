@@ -5,10 +5,8 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
 
 /**
  * @title  VaultShareToken
- * @notice The transferable ERC-20 a depositor actually holds. One is deployed per
- *         vault by `VaultAdminFacet.createVault`; its own address IS that vault's
- *         identity everywhere else in the protocol (AppStorage's vault-keyed
- *         mappings, `ReferralVault.registerVault`, `UserRewardVault.registerVault`).
+ * @notice The transferable ERC-20 a depositor actually holds. One is deployed by
+ *         each `Vault` in its constructor; mint/burn are restricted to that vault.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
  *   WHY A REAL ERC-20 AND NOT AN INTERNAL BALANCE MAPPING
@@ -16,60 +14,53 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
  *
  *  `UserRewardVault.stake(vault, user, amount)` pulls shares with a plain
  *  `safeTransferFrom` — that only works if shares are a real, independently
- *  transferable token the staking contract can be approved for. An internal
- *  balance mapping inside the Diamond's own storage (the old design's approach)
- *  cannot be staked, composed with, or held by any contract that doesn't know
- *  about the Diamond's internals. A standalone ERC-20 costs one extra deployment
- *  per vault and buys full composability for free.
+ *  transferable token the staking contract can be approved for. A standalone
+ *  ERC-20 costs one extra deployment per vault and buys full composability.
  *
- *  Decimals are fixed at 18 regardless of the base asset's own decimals (6 for
- *  USDC, 8 for WBTC, 18 for WETH, ...) — OZ's ERC20 default, left un-overridden.
- *  See LibVaultMath's header for why this matters for the inflation defense.
+ *  Decimals are fixed at 18 regardless of the base asset's own decimals — OZ's
+ *  ERC20 default, left un-overridden. See LibVaultMath for why this matters for
+ *  the inflation defense.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
- *   MINT / BURN ARE DIAMOND-ONLY
+ *   MINT / BURN ARE VAULT-ONLY
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  `diamond` is immutable and set once at deployment. Every facet's logic runs via
- *  `delegatecall` through the Diamond, so any facet calling `mint`/`burn` on this
- *  token does so with `msg.sender == diamond` regardless of which specific facet
- *  triggered it — the same property that makes `onlyVault` correct on every
- *  strategy contract (see BaseStrategy's header) makes `onlyDiamond` correct here.
+ *  `vault` is immutable and set once at deployment (the deploying Vault). Facet
+ *  logic runs via `delegatecall` through the Vault, so any facet calling
+ *  `mint`/`burn`/`spendAllowance` does so with `msg.sender == vault` regardless
+ *  of which facet triggered it.
  */
 contract VaultShareToken is ERC20 {
-    address public immutable diamond;
+    address public immutable vault;
 
     event Minted(address indexed to, uint256 amount);
     event Burned(address indexed from, uint256 amount);
 
-    modifier onlyDiamond() {
-        require(msg.sender == diamond, "NOT_DIAMOND");
+    modifier onlyVault() {
+        require(msg.sender == vault, "NOT_VAULT");
         _;
     }
 
-    constructor(address _diamond, string memory _name, string memory _symbol) ERC20(_name, _symbol) {
-        require(_diamond != address(0), "ZERO_ADDRESS");
-        diamond = _diamond;
+    constructor(address _vault, string memory _name, string memory _symbol) ERC20(_name, _symbol) {
+        require(_vault != address(0), "ZERO_ADDRESS");
+        vault = _vault;
     }
 
-    function mint(address to, uint256 amount) external onlyDiamond {
+    function mint(address to, uint256 amount) external onlyVault {
         _mint(to, amount);
         emit Minted(to, amount);
     }
 
-    function burn(address from, uint256 amount) external onlyDiamond {
+    function burn(address from, uint256 amount) external onlyVault {
         _burn(from, amount);
         emit Burned(from, amount);
     }
 
-    /// @notice Decrement `owner`'s allowance for `spender` by `amount`, the same
-    ///         way a plain `transferFrom` would. Lets the Diamond honor the
-    ///         standard ERC-4626 "withdraw on behalf of an owner via allowance"
-    ///         pattern even though `burn` itself bypasses `transferFrom` entirely
-    ///         (burn only ever moves supply, never a balance between two holders).
-    ///         Infinite approvals are left untouched, matching OZ's own
-    ///         `_spendAllowance` behavior.
-    function spendAllowance(address owner, address spender, uint256 amount) external onlyDiamond {
+    /// @notice Decrement `owner`'s allowance for `spender` by `amount`, letting the
+    ///         vault honor the ERC-4626 "withdraw on behalf of an owner via
+    ///         allowance" pattern even though `burn` bypasses `transferFrom`.
+    ///         Infinite approvals are left untouched, matching OZ's behavior.
+    function spendAllowance(address owner, address spender, uint256 amount) external onlyVault {
         _spendAllowance(owner, spender, amount);
     }
 }

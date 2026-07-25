@@ -4,45 +4,56 @@ pragma solidity ^0.8.20;
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
 /**
- * @title IStrategy
- * @notice The surface the vault (Diamond) sees. Every strategy — no matter how many
- *         external protocols it composes internally — presents exactly this, and only
- *         the vault may call the state-changing functions.
+ * @title IStrategy — stateless executor surface
+ * @notice The surface the Vault sees. A strategy CUSTODIES NOTHING: every DeFi
+ *         receipt (aToken, ERC-4626 share, LP/gauge position, venue-internal
+ *         ledger balance) is credited to the VAULT, and every redemption returns
+ *         base token to the VAULT. The strategy only executes venue interactions
+ *         on the vault's behalf; only the vault may call the state-changers.
  *
- *  The vault never learns which venue a strategy uses. It moves base token in with
- *  `deposit`, pulls it back with `withdraw`, reads the position's worth in base token
- *  with `totalAssets`, and periodically calls `harvest`. That is the entire contract.
+ *  INVEST   : the vault approves `assets` of base to the strategy; the strategy
+ *             pulls it and deposits into the venue with the receipt credited to
+ *             the vault (onBehalfOf / supplyTo / receiver = vault).
+ *  DIVEST   : the vault grants the strategy access to the needed receipt (ERC-20
+ *             approval, or an operator allowance for internal-ledger venues); the
+ *             strategy redeems and sends the freed base token to the vault.
+ *  HARVEST  : the strategy claims rewards, swaps to base, and sends base to the vault.
+ *  POSITION : `positionValue()` reads the VAULT's own holdings at the venue, in base.
  */
 interface IStrategy {
     /// @notice The base token this strategy accepts and reports in (e.g. USDC).
-    /// @dev    Typed as IERC20 (an address at the ABI level) so the vault can act on
-    ///         it directly and so BaseStrategy's public `asset` getter satisfies this.
     function asset() external view returns (IERC20);
 
-    /// @notice The only address allowed to deposit/withdraw/harvest.
+    /// @notice The vault this strategy serves — the only allowed caller.
     function vault() external view returns (address);
 
-    /// @notice Current worth of the whole position, denominated in `asset`.
-    ///         Includes principal, accrued interest, and (haircut-adjusted) the value
-    ///         of any not-yet-claimed reward tokens.
-    function totalAssets() external view returns (uint256);
+    /// @notice The receipt token the VAULT holds for this strategy (aToken,
+    ///         4626 share, LP token...). `address(0)` for internal-ledger venues
+    ///         (e.g. Compound V3) where the position is not a transferable token.
+    function receiptToken() external view returns (address);
 
-    /// @notice How much `asset` could be withdrawn right now, bounded by venue liquidity.
+    /// @notice Current worth of the VAULT's position at this venue, in base token.
+    ///         Includes principal, accrued interest, and (haircut-adjusted) the
+    ///         value of any not-yet-claimed reward tokens.
+    function positionValue() external view returns (uint256);
+
+    /// @notice How much base could be divested right now, bounded by venue liquidity.
     function maxWithdraw() external view returns (uint256);
 
-    /// @notice Pull `assets` of base token from the vault and deploy it. Vault-only.
-    function deposit(uint256 assets) external;
+    /// @notice Pull `assets` of base (pre-approved by the vault) and deploy it,
+    ///         crediting the venue receipt to the vault. Vault-only.
+    function invest(uint256 assets) external;
 
-    /// @notice Free up to `assets` of base token and send it to the vault. Returns the
-    ///         amount actually delivered (may be less on slippage/venue limits). Vault-only.
-    function withdraw(uint256 assets) external returns (uint256 withdrawn);
+    /// @notice Free up to `assets` of base and send it to the vault. Returns the
+    ///         amount actually delivered (may be less on slippage/venue limits).
+    ///         The vault must have granted receipt access first. Vault-only.
+    function divest(uint256 assets) external returns (uint256 withdrawn);
 
-    /// @notice Claim reward tokens, swap them to base, and reinvest. Vault-only —
-    ///         gated so nobody can force tiny, gas/slippage-negative harvests.
-    ///         Returns the base-token amount realized this harvest.
+    /// @notice Claim rewards, swap to base, send base to the vault. Returns the
+    ///         base realized. Vault-only.
     function harvest() external returns (uint256 harvested);
 
-    /// @notice Unwind the entire position to base token and return it to the vault,
+    /// @notice Unwind the entire position to base and send it to the vault,
     ///         skipping reward accounting. The escape hatch. Vault-only.
     function emergencyWithdraw() external returns (uint256 withdrawn);
 }
