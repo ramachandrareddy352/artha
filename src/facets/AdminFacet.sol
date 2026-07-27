@@ -72,7 +72,7 @@ contract AdminFacet is VaultModifiers {
         external
         onlyGovernance
     {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         s.tvlCap = tvlCap;
         s.depositCapPerBlock = depositCapPerBlock;
         s.withdrawCapPerBlock = withdrawCapPerBlock;
@@ -81,19 +81,19 @@ contract AdminFacet is VaultModifiers {
     }
 
     function setCapExempt(address who, bool exempt) external onlyGovernance {
-        VaultStorage.layout().isCapExempt[who] = exempt;
+        VaultStorage.vaultLayout().isCapExempt[who] = exempt;
         emit CapExemptSet(who, exempt);
     }
 
     function setIdleTargetBps(uint16 bps) external onlyGovernance {
         require(bps <= MAX_IDLE_BPS, "IDLE_TOO_HIGH");
-        VaultStorage.layout().idleTargetBps = bps;
+        VaultStorage.vaultLayout().idleTargetBps = bps;
         emit IdleTargetSet(bps);
     }
 
     function setPerformanceFee(uint16 bps) external onlyGovernance {
         require(bps <= MAX_PERFORMANCE_FEE_BPS, "FEE_TOO_HIGH");
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         uint16 old = s.performanceFeeBps;
         s.performanceFeeBps = bps;
         emit PerformanceFeeSet(old, bps);
@@ -103,37 +103,37 @@ contract AdminFacet is VaultModifiers {
     ///      BPS_DENOMINATOR to run without an effective breaker, never 0.
     function setStrategyMaxDeltaBps(uint16 bps) external onlyGovernance {
         require(bps != 0 && bps <= BPS_DENOMINATOR, "INVALID_MAX_DELTA");
-        VaultStorage.layout().strategyMaxDeltaBps = bps;
+        VaultStorage.vaultLayout().strategyMaxDeltaBps = bps;
         emit StrategyMaxDeltaSet(bps);
     }
 
     function setHarvestMaxImpactBps(uint16 bps) external onlyGovernance {
         require(bps <= BPS_DENOMINATOR, "INVALID_BPS");
-        VaultStorage.layout().harvestMaxImpactBps = bps;
+        VaultStorage.vaultLayout().harvestMaxImpactBps = bps;
         emit HarvestMaxImpactSet(bps);
     }
 
     // ═══════════════════════════ roles ════════════════════════════════════════════
 
     function setKeeper(address who, bool isKeeper_) external onlyGovernance {
-        VaultStorage.layout().isKeeper[who] = isKeeper_;
+        VaultStorage.vaultLayout().isKeeper[who] = isKeeper_;
         emit KeeperSet(who, isKeeper_);
     }
 
     function setGuardian(address who, bool isGuardian_) external onlyGovernance {
-        VaultStorage.layout().isGuardian[who] = isGuardian_;
+        VaultStorage.vaultLayout().isGuardian[who] = isGuardian_;
         emit GuardianSet(who, isGuardian_);
     }
 
     function setTreasury(address treasury) external onlyGovernance {
         require(treasury != address(0), "ZERO_ADDRESS");
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         emit TreasurySet(s.treasury, treasury);
         s.treasury = treasury;
     }
 
     function transferGovernance(address newGovernance) external onlyGovernance {
         require(newGovernance != address(0), "ZERO_ADDRESS");
-        VaultStorage.layout().governance = newGovernance;
+        VaultStorage.vaultLayout().governance = newGovernance;
     }
 }

@@ -17,8 +17,7 @@ import {ViewFacet} from "./facets/ViewFacet.sol";
  * @notice One `Vault` is deployed per base asset. It is BOTH:
  *
  *   1. The ROUTER — it registers each facet's selectors in its own namespaced
- *      storage and `fallback()`-delegatecalls into them, exactly like the
- *      perpetual `Pool`. There is no shared Diamond and no slot-0 AppStorage —
+ *      storage and `fallback()`-delegatecalls into them. There is no shared Diamond and no slot-0 AppStorage —
  *      every vault has its OWN `VaultStorage.Layout` at a fixed keccak slot, so
  *      two vaults never share state and custody is never commingled.
  *
@@ -41,20 +40,20 @@ import {ViewFacet} from "./facets/ViewFacet.sol";
 contract Vault {
     struct InitConfig {
         address baseAsset;
-        string name;
-        string symbol;
         address governance;
         address treasury;
         address keeper; // initial keeper, address(0) to skip
         address guardian; // initial guardian, address(0) to skip
         uint16 idleTargetBps;
+        uint16 performanceFeeBps;
+        uint16 strategyMaxDeltaBps;
+        uint16 harvestMaxImpactBps;
         uint256 minDeposit;
         uint256 tvlCap;
         uint256 depositCapPerBlock;
         uint256 withdrawCapPerBlock;
-        uint16 performanceFeeBps;
-        uint16 strategyMaxDeltaBps;
-        uint16 harvestMaxImpactBps;
+        string name;
+        string symbol;
     }
 
     struct Facets {
@@ -67,10 +66,10 @@ contract Vault {
     }
 
     event VaultInitialized(address indexed shareToken, address indexed baseAsset, address governance);
-    event FacetSet(bytes4 indexed selector, address indexed facet);
+    event FacetSet(bytes4 selector, address facet);
 
     modifier onlyGovernance() {
-        require(msg.sender == VaultStorage.layout().governance, "NOT_GOVERNANCE");
+        require(msg.sender == VaultStorage.vaultLayout().governance, "NOT_GOVERNANCE");
         _;
     }
 
@@ -82,7 +81,7 @@ contract Vault {
         require(c.strategyMaxDeltaBps != 0 && c.strategyMaxDeltaBps <= BPS_DENOMINATOR, "INVALID_MAX_DELTA");
         require(c.harvestMaxImpactBps <= BPS_DENOMINATOR, "INVALID_BPS");
 
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(!s.initialized, "ALREADY_INIT");
         s.initialized = true;
 
@@ -181,22 +180,22 @@ contract Vault {
     /// @notice Re-point a selector to a new facet (add/replace/remove). Governance
     ///         only — the single way this vault's logic ever changes.
     function setFacet(bytes4 selector, address facet) external onlyGovernance {
-        VaultStorage.layout().selectorToFacet[selector] = facet;
+        VaultStorage.vaultLayout().selectorToFacet[selector] = facet;
         emit FacetSet(selector, facet);
     }
 
     function facetOf(bytes4 selector) external view returns (address) {
-        return VaultStorage.layout().selectorToFacet[selector];
+        return VaultStorage.vaultLayout().selectorToFacet[selector];
     }
 
     function shareToken() external view returns (address) {
-        return VaultStorage.layout().shareToken;
+        return VaultStorage.vaultLayout().shareToken;
     }
 
     // ═══════════════════════════ router ═══════════════════════════════════════════
 
     fallback() external payable {
-        address facet = VaultStorage.layout().selectorToFacet[msg.sig];
+        address facet = VaultStorage.vaultLayout().selectorToFacet[msg.sig];
         require(facet != address(0), "FUNCTION_NOT_FOUND");
 
         assembly {

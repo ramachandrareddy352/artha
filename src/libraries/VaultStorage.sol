@@ -42,9 +42,7 @@ uint16 constant MAX_PERFORMANCE_FEE_BPS = 3_000;
  *   ONE DEPLOYED VAULT = ONE STORAGE. NO SHARED, VAULT-KEYED MAPPINGS.
  *  ═══════════════════════════════════════════════════════════════════════════
  *
- *  Unlike the previous single-Diamond-many-vaults design (one AppStorage at
- *  slot 0 keyed by `address vault`), EVERY vault is now its OWN deployed
- *  `Vault` contract with its OWN copy of this struct. There is no `vault` key
+ *  The `Vault` contract is now its OWN deployed instance with its OWN copy of this struct. There is no `vault` key
  *  anywhere — a field like `idleBalance` is simply THIS vault's idle balance.
  *  Two vaults never share a slot, so one vault's accounting can never touch
  *  another's, and the base-asset custody is not commingled across vaults.
@@ -139,7 +137,7 @@ library VaultStorage {
         uint256[50] __gap;
     }
 
-    function layout() internal pure returns (Layout storage s) {
+    function vaultLayout() internal pure returns (Layout storage s) {
         bytes32 slot = STORAGE_SLOT;
         assembly {
             s.slot := slot
@@ -154,7 +152,7 @@ library VaultStorage {
  * @notice Shared access-control + reentrancy modifiers for every facet.
  *
  *  Facets are stateless logic delegatecalled by the `Vault`, so `address(this)`
- *  inside a facet is the vault instance and `VaultStorage.layout()` resolves to
+ *  inside a facet is the vault instance and `VaultStorage.vaultLayout()` resolves to
  *  THAT vault's storage. These modifiers read roles straight out of it.
  *
  *  The reentrancy lock is a single shared storage flag (not per-facet), because
@@ -163,27 +161,27 @@ library VaultStorage {
  */
 abstract contract VaultModifiers {
     modifier onlyGovernance() {
-        require(msg.sender == VaultStorage.layout().governance, "NOT_GOVERNANCE");
+        require(msg.sender == VaultStorage.vaultLayout().governance, "NOT_GOVERNANCE");
         _;
     }
 
     modifier onlyKeeper() {
-        require(VaultStorage.layout().isKeeper[msg.sender], "NOT_KEEPER");
+        require(VaultStorage.vaultLayout().isKeeper[msg.sender], "NOT_KEEPER");
         _;
     }
 
     modifier onlyGuardian() {
-        require(VaultStorage.layout().isGuardian[msg.sender], "NOT_GUARDIAN");
+        require(VaultStorage.vaultLayout().isGuardian[msg.sender], "NOT_GUARDIAN");
         _;
     }
 
     modifier whenNotPaused() {
-        require(!VaultStorage.layout().paused, "PAUSED");
+        require(!VaultStorage.vaultLayout().paused, "PAUSED");
         _;
     }
 
     modifier nonReentrant() {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(!s.reentrancyLocked, "REENTRANCY");
         s.reentrancyLocked = true;
         _;

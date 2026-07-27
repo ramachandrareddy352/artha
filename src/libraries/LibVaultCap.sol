@@ -20,7 +20,7 @@ library LibVaultCap {
     event WithdrawCapConsumed(uint256 blockNumber, uint256 amount, uint256 cumulative);
 
     function checkAndConsumeDeposit(address who, uint256 amount) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         if (s.isCapExempt[who]) return;
 
         uint256 cap = s.depositCapPerBlock;
@@ -39,7 +39,7 @@ library LibVaultCap {
     }
 
     function checkAndConsumeWithdraw(address who, uint256 amount) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         if (s.isCapExempt[who]) return;
 
         uint256 cap = s.withdrawCapPerBlock;

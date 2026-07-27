@@ -57,7 +57,7 @@ library LibVaultNav {
     ///         Permissionless-safe: it can only ever increase idle by real,
     ///         already-received tokens, never move value out.
     function sync() internal returns (uint256 creditedExtra) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         uint256 actualBase = IERC20(s.baseAsset).balanceOf(address(this));
         if (actualBase > s.idleBalance) {
             creditedExtra = actualBase - s.idleBalance;
@@ -69,7 +69,7 @@ library LibVaultNav {
     /// @notice Recompute and store `navCheckpoint`. Call this FIRST in every
     ///         state-changing vault entry point, before any share-math conversion.
     function refreshNav() internal returns (uint256 totalAssets) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         totalAssets = s.idleBalance;
 
@@ -122,6 +122,6 @@ library LibVaultNav {
 
     /// @notice Read-only view of the last checkpoint, no refresh.
     function cachedTotalAssets() internal view returns (uint256) {
-        return VaultStorage.layout().navCheckpoint;
+        return VaultStorage.vaultLayout().navCheckpoint;
     }
 }

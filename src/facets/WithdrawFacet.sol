@@ -41,7 +41,7 @@ contract WithdrawFacet is VaultModifiers {
         whenNotPaused
         returns (uint256 shares)
     {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(block.timestamp <= deadline, "EXPIRED");
         require(receiver != address(0) && owner != address(0), "ZERO_ADDRESS");
         require(assets != 0, "ZERO_ASSETS");
@@ -64,7 +64,7 @@ contract WithdrawFacet is VaultModifiers {
         whenNotPaused
         returns (uint256 assets)
     {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(block.timestamp <= deadline, "EXPIRED");
         require(receiver != address(0) && owner != address(0), "ZERO_ADDRESS");
         require(shares != 0, "ZERO_SHARES");

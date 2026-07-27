@@ -31,33 +31,33 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
  */
 library LibVaultMath {
     function _supply() private view returns (uint256) {
-        return IERC20(VaultStorage.layout().shareToken).totalSupply();
+        return IERC20(VaultStorage.vaultLayout().shareToken).totalSupply();
     }
 
     /// @dev assets -> shares, rounding DOWN. Used by deposit().
     function convertToSharesDown(uint256 assets) internal view returns (uint256) {
-        uint256 ta = VaultStorage.layout().navCheckpoint;
+        uint256 ta = VaultStorage.vaultLayout().navCheckpoint;
         uint256 offset = 10 ** DECIMALS_OFFSET;
         return Math.mulDiv(assets, _supply() + offset, ta + 1, Math.Rounding.Floor);
     }
 
     /// @dev shares -> assets required, rounding UP. Used by mint().
     function convertToAssetsUp(uint256 shares) internal view returns (uint256) {
-        uint256 ta = VaultStorage.layout().navCheckpoint;
+        uint256 ta = VaultStorage.vaultLayout().navCheckpoint;
         uint256 offset = 10 ** DECIMALS_OFFSET;
         return Math.mulDiv(shares, ta + 1, _supply() + offset, Math.Rounding.Ceil);
     }
 
     /// @dev assets -> shares burned, rounding UP. Used by withdraw().
     function convertToSharesUp(uint256 assets) internal view returns (uint256) {
-        uint256 ta = VaultStorage.layout().navCheckpoint;
+        uint256 ta = VaultStorage.vaultLayout().navCheckpoint;
         uint256 offset = 10 ** DECIMALS_OFFSET;
         return Math.mulDiv(assets, _supply() + offset, ta + 1, Math.Rounding.Ceil);
     }
 
     /// @dev shares -> assets returned, rounding DOWN. Used by redeem().
     function convertToAssetsDown(uint256 shares) internal view returns (uint256) {
-        uint256 ta = VaultStorage.layout().navCheckpoint;
+        uint256 ta = VaultStorage.vaultLayout().navCheckpoint;
         uint256 offset = 10 ** DECIMALS_OFFSET;
         return Math.mulDiv(shares, ta + 1, _supply() + offset, Math.Rounding.Floor);
     }
@@ -66,7 +66,7 @@ library LibVaultMath {
     ///         used for deposit/withdraw math — only for display and the
     ///         high-water-mark fee comparison.
     function pricePerShare() internal view returns (uint256) {
-        uint256 ta = VaultStorage.layout().navCheckpoint;
+        uint256 ta = VaultStorage.vaultLayout().navCheckpoint;
         uint256 offset = 10 ** DECIMALS_OFFSET;
         return Math.mulDiv(ta + 1, PPS_SCALE, _supply() + offset, Math.Rounding.Floor);
     }

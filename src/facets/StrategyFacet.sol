@@ -26,7 +26,7 @@ contract StrategyFacet is VaultModifiers {
     // ═══════════════════════════════ harvest ══════════════════════════════════════
 
     function harvest(address strategy) external onlyKeeper nonReentrant returns (uint256 realized) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(!s.strategyBroken[strategy], "STRATEGY_BROKEN");
         realized = IStrategy(strategy).harvest();
         if (realized != 0) s.idleBalance += realized;
@@ -35,7 +35,7 @@ contract StrategyFacet is VaultModifiers {
     }
 
     function harvestAll() external onlyKeeper nonReentrant {
-        _harvestAll(VaultStorage.layout(), false);
+        _harvestAll(VaultStorage.vaultLayout(), false);
         LibVaultNav.refreshNav();
     }
 
@@ -48,7 +48,7 @@ contract StrategyFacet is VaultModifiers {
     // ═══════════════════════════ capital deployment ═══════════════════════════════
 
     function deployIdle() external onlyKeeper whenNotPaused nonReentrant {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         uint256 totalAssets = LibVaultNav.refreshNav();
         uint256 targetIdle = (totalAssets * s.idleTargetBps) / BPS_DENOMINATOR;
         uint256 idle = s.idleBalance;
@@ -77,7 +77,7 @@ contract StrategyFacet is VaultModifiers {
     }
 
     function rebalance() external onlyKeeper whenNotPaused nonReentrant {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         // Step 1: harvest everything first (hard revert on failure).
         _harvestAll(s, true);

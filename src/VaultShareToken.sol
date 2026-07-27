@@ -8,23 +8,8 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
  * @notice The transferable ERC-20 a depositor actually holds. One is deployed by
  *         each `Vault` in its constructor; mint/burn are restricted to that vault.
  *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   WHY A REAL ERC-20 AND NOT AN INTERNAL BALANCE MAPPING
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  `UserRewardVault.stake(vault, user, amount)` pulls shares with a plain
- *  `safeTransferFrom` — that only works if shares are a real, independently
- *  transferable token the staking contract can be approved for. A standalone
- *  ERC-20 costs one extra deployment per vault and buys full composability.
- *
- *  Decimals are fixed at 18 regardless of the base asset's own decimals — OZ's
- *  ERC20 default, left un-overridden. See LibVaultMath for why this matters for
- *  the inflation defense.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   MINT / BURN ARE VAULT-ONLY
- *  ═══════════════════════════════════════════════════════════════════════════
- *
+ *  Decimals are fixed at 18 regardless of the base asset's own decimals
+ * 
  *  `vault` is immutable and set once at deployment (the deploying Vault). Facet
  *  logic runs via `delegatecall` through the Vault, so any facet calling
  *  `mint`/`burn`/`spendAllowance` does so with `msg.sender == vault` regardless

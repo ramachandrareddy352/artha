@@ -31,12 +31,12 @@ contract EmergencyFacet is VaultModifiers {
     // ═══════════════════════════════ pause ════════════════════════════════════════
 
     function pauseVault() external onlyGuardian {
-        VaultStorage.layout().paused = true;
+        VaultStorage.vaultLayout().paused = true;
         emit VaultPaused(msg.sender);
     }
 
     function unpauseVault() external onlyGovernance {
-        VaultStorage.layout().paused = false;
+        VaultStorage.vaultLayout().paused = false;
         emit VaultUnpaused(msg.sender);
     }
 
@@ -56,7 +56,7 @@ contract EmergencyFacet is VaultModifiers {
         nonReentrant
         returns (uint256 assetsReceived)
     {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(receiver != address(0) && owner != address(0), "ZERO_ADDRESS");
         require(shares != 0, "ZERO_SHARES");
 

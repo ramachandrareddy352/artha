@@ -46,7 +46,7 @@ library LibVaultFee {
     event HighWaterMarkRaised(uint256 oldMark, uint256 newMark);
 
     function chargePerformanceFee() internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         uint256 supply = IERC20(s.shareToken).totalSupply();
         if (supply == 0) return; // nothing to dilute, nothing to charge

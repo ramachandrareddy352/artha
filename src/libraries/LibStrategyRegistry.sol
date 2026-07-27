@@ -49,7 +49,7 @@ library LibStrategyRegistry {
     ///         venue receipt to this vault. Updates idle + tracked value.
     function investInto(address strategy, uint256 amount) internal {
         if (amount == 0) return;
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         IERC20(s.baseAsset).forceApprove(strategy, amount);
         IStrategy(strategy).invest(amount);
@@ -64,7 +64,7 @@ library LibStrategyRegistry {
     ///         Keeps the circuit-breaker cache honest by decrementing tracked value.
     function divestFrom(address strategy, uint256 amount) internal returns (uint256 freed) {
         if (amount == 0) return 0;
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         address receipt = IStrategy(strategy).receiptToken();
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
@@ -81,7 +81,7 @@ library LibStrategyRegistry {
     /// @notice Fully unwind a strategy's position to base (emergency path — no
     ///         harvest, no slippage bound), crediting the proceeds to idle.
     function fullExit(address strategy) internal returns (uint256 freed) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         address receipt = IStrategy(strategy).receiptToken();
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
@@ -100,7 +100,7 @@ library LibStrategyRegistry {
         uint16[] memory allWeightsBps,
         uint16 idleTargetBps
     ) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(strategy != address(0), "ZERO_ADDRESS");
         require(IStrategy(strategy).vault() == address(this), "STRATEGY_VAULT_MISMATCH");
         require(IStrategy(strategy).asset() == IERC20(s.baseAsset), "STRATEGY_ASSET_MISMATCH");
@@ -118,7 +118,7 @@ library LibStrategyRegistry {
     }
 
     function setTargets(address[] memory strategies_, uint16[] memory weightsBps, uint16 idleTargetBps) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(strategies_.length == weightsBps.length, "LENGTH_MISMATCH");
         require(idleTargetBps <= MAX_IDLE_BPS, "IDLE_TOO_HIGH");
 
@@ -145,14 +145,14 @@ library LibStrategyRegistry {
     }
 
     function setDisabled(address strategy, bool disabled) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
         s.strategyDisabled[strategy] = disabled;
         emit StrategyDisabledSet(strategy, disabled);
     }
 
     function clearCircuitBreak(address strategy) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
         s.strategyBroken[strategy] = false;
         emit StrategyCircuitCleared(strategy);
@@ -162,7 +162,7 @@ library LibStrategyRegistry {
     ///         unless already broken), unwinds everything to idle, and requires the
     ///         residual to be <= dustFloor.
     function removeStrategy(address strategy, uint256 dustFloor) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
 
         if (!s.strategyBroken[strategy]) {
@@ -188,7 +188,7 @@ library LibStrategyRegistry {
 
     /// @notice Atomically replace `from` with `to`, carrying the target weight over.
     function migrateStrategy(address from, address to) internal {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(_isKnown(s, from), "UNKNOWN_STRATEGY");
         require(to != address(0), "ZERO_ADDRESS");
         require(IStrategy(to).vault() == address(this), "STRATEGY_VAULT_MISMATCH");

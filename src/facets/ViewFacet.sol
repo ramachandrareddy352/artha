@@ -61,21 +61,21 @@ contract ViewFacet is VaultModifiers {
     // ═══════════════════════════════ liquidity-bounded maxima ═════════════════════
 
     function maxWithdraw(address owner) external view returns (uint256) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         uint256 ownerAssets = LibVaultMath.convertToAssetsDown(IERC20(s.shareToken).balanceOf(owner));
         uint256 liquidity = _availableLiquidity(s);
         return ownerAssets < liquidity ? ownerAssets : liquidity;
     }
 
     function maxRedeem(address owner) external view returns (uint256) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         uint256 ownerShares = IERC20(s.shareToken).balanceOf(owner);
         uint256 liquidityShares = LibVaultMath.convertToSharesDown(_availableLiquidity(s));
         return ownerShares < liquidityShares ? ownerShares : liquidityShares;
     }
 
     function availableLiquidity() external view returns (uint256) {
-        return _availableLiquidity(VaultStorage.layout());
+        return _availableLiquidity(VaultStorage.vaultLayout());
     }
 
     function _availableLiquidity(VaultStorage.Layout storage s) private view returns (uint256 total) {
@@ -92,7 +92,7 @@ contract ViewFacet is VaultModifiers {
     // ═══════════════════════════════ config / registry ════════════════════════════
 
     function vaultConfig() external view returns (VaultConfigView memory v) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         v.baseAsset = s.baseAsset;
         v.baseDecimals = s.baseDecimals;
         v.shareToken = s.shareToken;
@@ -111,37 +111,37 @@ contract ViewFacet is VaultModifiers {
     }
 
     function strategyList() external view returns (address[] memory) {
-        return VaultStorage.layout().strategies;
+        return VaultStorage.vaultLayout().strategies;
     }
 
     function strategyWeightBps(address strategy) external view returns (uint16) {
-        return VaultStorage.layout().strategyWeightBps[strategy];
+        return VaultStorage.vaultLayout().strategyWeightBps[strategy];
     }
 
     function strategyStatus(address strategy) external view returns (bool disabled, bool broken, uint256 lastValue) {
-        VaultStorage.Layout storage s = VaultStorage.layout();
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         disabled = s.strategyDisabled[strategy];
         broken = s.strategyBroken[strategy];
         lastValue = s.strategyLastValue[strategy];
     }
 
     function isKeeper(address who) external view returns (bool) {
-        return VaultStorage.layout().isKeeper[who];
+        return VaultStorage.vaultLayout().isKeeper[who];
     }
 
     function isGuardian(address who) external view returns (bool) {
-        return VaultStorage.layout().isGuardian[who];
+        return VaultStorage.vaultLayout().isGuardian[who];
     }
 
     function isCapExempt(address who) external view returns (bool) {
-        return VaultStorage.layout().isCapExempt[who];
+        return VaultStorage.vaultLayout().isCapExempt[who];
     }
 
     function governance() external view returns (address) {
-        return VaultStorage.layout().governance;
+        return VaultStorage.vaultLayout().governance;
     }
 
     function treasury() external view returns (address) {
-        return VaultStorage.layout().treasury;
+        return VaultStorage.vaultLayout().treasury;
     }
 }
