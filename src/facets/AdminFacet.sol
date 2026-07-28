@@ -72,6 +72,9 @@ contract AdminFacet is VaultModifiers {
         external
         onlyGovernance
     {
+        // Flow caps live in a uint192-packed slot — bound them so the cumulative
+        // downcast in LibVaultCap can never truncate.
+        require(depositCapPerBlock <= type(uint192).max && withdrawCapPerBlock <= type(uint192).max, "CAP_TOO_HIGH");
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         s.tvlCap = tvlCap;
         s.depositCapPerBlock = depositCapPerBlock;

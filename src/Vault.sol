@@ -17,8 +17,8 @@ import {ViewFacet} from "./facets/ViewFacet.sol";
  * @notice One `Vault` is deployed per base asset. It is BOTH:
  *
  *   1. The ROUTER — it registers each facet's selectors in its own namespaced
- *      storage and `fallback()`-delegatecalls into them. There is no shared Diamond and no slot-0 AppStorage —
- *      every vault has its OWN `VaultStorage.Layout` at a fixed keccak slot, so
+ *      storage and `fallback()`-delegatecalls into them.
+ *      Every vault has its OWN `VaultStorage.Layout` at a fixed keccak slot, so
  *      two vaults never share state and custody is never commingled.
  *
  *   2. The CUSTODIAN — it holds the base asset (idle) AND every DeFi receipt
@@ -41,14 +41,14 @@ contract Vault {
     struct InitConfig {
         address baseAsset;
         address governance;
-        address treasury;
+        address treasury; // performance fee recipient
         address keeper; // initial keeper, address(0) to skip
         address guardian; // initial guardian, address(0) to skip
         uint16 idleTargetBps;
         uint16 performanceFeeBps;
         uint16 strategyMaxDeltaBps;
         uint16 harvestMaxImpactBps;
-        uint256 minDeposit;
+        uint256 minDeposit;   // in terms of base asset, not shares
         uint256 tvlCap;
         uint256 depositCapPerBlock;
         uint256 withdrawCapPerBlock;
@@ -80,10 +80,14 @@ contract Vault {
         require(c.performanceFeeBps <= MAX_PERFORMANCE_FEE_BPS, "FEE_TOO_HIGH");
         require(c.strategyMaxDeltaBps != 0 && c.strategyMaxDeltaBps <= BPS_DENOMINATOR, "INVALID_MAX_DELTA");
         require(c.harvestMaxImpactBps <= BPS_DENOMINATOR, "INVALID_BPS");
+        // Flow caps are tracked in a uint192-packed slot; bound the setters so the
+        // cumulative downcast can never truncate (trivially true for any real cap).
+        require(c.depositCapPerBlock <= type(uint192).max && c.withdrawCapPerBlock <= type(uint192).max, "CAP_TOO_HIGH");
 
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(!s.initialized, "ALREADY_INIT");
         s.initialized = true;
+        s.reentrancyStatus = 1; // OZ-style: seed to "not entered" so the lock stays nonzero
 
         VaultShareToken token = new VaultShareToken(address(this), c.name, c.symbol);
         s.shareToken = address(token);

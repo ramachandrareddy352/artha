@@ -26,15 +26,17 @@ library LibVaultCap {
         uint256 cap = s.depositCapPerBlock;
         if (cap == 0) return; // 0 = uncapped
 
-        if (s.depositFlowBlock != block.number) {
-            s.depositFlowBlock = block.number;
+        if (s.depositFlowBlock != uint64(block.number)) {
+            s.depositFlowBlock = uint64(block.number);
             s.depositFlowAmount = 0;
         }
 
-        uint256 cumulative = s.depositFlowAmount + amount;
+        // `cap <= type(uint192).max` is enforced in the setters, and cumulative <= cap
+        // is required below, so the uint192 downcast can never truncate.
+        uint256 cumulative = uint256(s.depositFlowAmount) + amount;
         require(cumulative <= cap, "DEPOSIT_CAP_EXCEEDED");
 
-        s.depositFlowAmount = cumulative;
+        s.depositFlowAmount = uint192(cumulative);
         emit DepositCapConsumed(block.number, amount, cumulative);
     }
 
@@ -45,15 +47,15 @@ library LibVaultCap {
         uint256 cap = s.withdrawCapPerBlock;
         if (cap == 0) return;
 
-        if (s.withdrawFlowBlock != block.number) {
-            s.withdrawFlowBlock = block.number;
+        if (s.withdrawFlowBlock != uint64(block.number)) {
+            s.withdrawFlowBlock = uint64(block.number);
             s.withdrawFlowAmount = 0;
         }
 
-        uint256 cumulative = s.withdrawFlowAmount + amount;
+        uint256 cumulative = uint256(s.withdrawFlowAmount) + amount;
         require(cumulative <= cap, "WITHDRAW_CAP_EXCEEDED");
 
-        s.withdrawFlowAmount = cumulative;
+        s.withdrawFlowAmount = uint192(cumulative);
         emit WithdrawCapConsumed(block.number, amount, cumulative);
     }
 }

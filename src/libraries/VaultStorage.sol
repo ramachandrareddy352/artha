@@ -13,7 +13,7 @@ uint16 constant MAX_IDLE_BPS = 1_000;
 
 // A vault may hold at most 5 active strategies. Keeps NAV computation,
 // reallocation, and withdrawal draining bounded and reviewable.
-uint256 constant MAX_STRATEGIES_PER_VAULT = 5;
+uint8 constant MAX_STRATEGIES_PER_VAULT = 5;
 
 // Fixed decimals for every vault's share token, independent of the base
 // asset's own decimals. Required so the virtual-offset inflation defense
@@ -54,7 +54,6 @@ uint16 constant MAX_PERFORMANCE_FEE_BPS = 3_000;
  *  ═══════════════════════════════════════════════════════════════════════════
  *   THE VAULT IS BOTH ROUTER AND CUSTODIAN
  *  ═══════════════════════════════════════════════════════════════════════════
- *
  *  The `Vault` holds the base asset (idle) AND every DeFi receipt (aTokens,
  *  ERC-4626 shares, LP/gauge positions, venue-internal ledger balances credited
  *  to the vault). Strategies custody nothing — they are stateless executors the
@@ -75,62 +74,53 @@ library VaultStorage {
         keccak256(abi.encode(uint256(keccak256("artha.vault.storage")) - 1)) & ~bytes32(uint256(0xff));
 
     struct Layout {
-        // ============================ identity / roles ==========================
-        /// @notice The base token (USDC, WETH, ...). Immutable in spirit, set at init.
-        address baseAsset;
-        uint8 baseDecimals;
-        /// @notice This vault's own share ERC-20 (mint/burn only by this vault).
-        address shareToken;
-        /// @notice Governance (the ArthaTimelock). Sole config/upgrade authority.
-        address governance;
-        /// @notice Destination for the protocol's share of performance fees.
-        address treasury;
-        /// @notice Bounded automation identity: harvest / deployIdle / rebalance.
+        address shareToken; // 20B — this vault's own share ERC-20 (mint/burn by this vault)
+        uint8 baseDecimals; //  1B
+        uint16 idleTargetBps; //  2B
+        uint16 performanceFeeBps; //  2B
+        uint16 strategyMaxDeltaBps; //  2B — read in refreshNav's circuit breaker
+        uint16 harvestMaxImpactBps; //  2B
+        bool paused; //  1B — read first by whenNotPaused, warms the whole slot
+        bool initialized; //  1B — set once at init, prevents re-initialization
+
+        /// @notice 1 = not entered, 2 = entered. 
+        uint256 reentrancyStatus;
+
+        address baseAsset; // the base token (USDC, WETH, ...)
+        address governance; // the ArthaTimelock — sole config/upgrade authority
+        address treasury; // destination for the protocol's fee shares
+
+        // ═══════════════════════ roles / exemptions (mappings) ═══════════════════
         mapping(address => bool) isKeeper;
-        /// @notice May PAUSE this vault instantly; may NEVER unpause.
         mapping(address => bool) isGuardian;
+        mapping(address => bool) isCapExempt;
 
-        // ============================ flags / lock ==============================
-        bool paused;
-        /// @notice Reentrancy lock (false = not entered, true = entered).
-        bool reentrancyLocked;
-        /// @notice Set once by `initialize`, prevents re-initialization.
-        bool initialized;
+        // ═══════════════════════ balances / NAV (hot writes, own slot) ═══════════
+        uint256 idleBalance; // base held by this vault, un-deployed
+        uint256 navCheckpoint; // last computed totalAssets
+        uint256 highWaterMarkPps; // PPS_SCALE fixed point; ratchets up
 
-        // ============================ balances / NAV ============================
-        /// @notice Base-token units held by this vault, un-deployed to any strategy.
-        uint256 idleBalance;
-        /// @notice Last computed totalAssets (idle + Σ strategy positionValue).
-        uint256 navCheckpoint;
-
-        // ============================ config ====================================
-        uint16 idleTargetBps;
+        // ═══════════════════════ config limits (large, cold) ═════════════════════
         uint256 minDeposit; // base-token units; 0 = no floor
         uint256 tvlCap; // base-token units; 0 = uncapped
+        uint256 depositCapPerBlock; // 0 = uncapped (bounded to uint192 in setters)
+        uint256 withdrawCapPerBlock; // 0 = uncapped (bounded to uint192 in setters)
 
-        // ---- per-block flow caps ----
-        uint256 depositCapPerBlock; // 0 = uncapped
-        uint256 withdrawCapPerBlock; // 0 = uncapped
-        mapping(address => bool) isCapExempt;
-        uint256 depositFlowBlock;
-        uint256 depositFlowAmount;
-        uint256 withdrawFlowBlock;
-        uint256 withdrawFlowAmount;
+        // ═══════════════════════ per-block flow (packed pairs) ═══════════════════
+        // block + cumulative amount are written together each capped op -> one slot.
+        uint64 depositFlowBlock;
+        uint192 depositFlowAmount;
+        uint64 withdrawFlowBlock;
+        uint192 withdrawFlowAmount;
 
-        // ---- fees ----
-        uint16 performanceFeeBps;
-        uint256 highWaterMarkPps; // PPS_SCALE fixed point
-        uint16 harvestMaxImpactBps;
-
-        // ============================ strategies ================================
+        // ═══════════════════════ strategies ══════════════════════════════════════
         address[] strategies; // priority order; withdrawal drains index 0 first
         mapping(address => uint16) strategyWeightBps;
         mapping(address => bool) strategyDisabled; // blocks new deploys only
         mapping(address => bool) strategyBroken; // circuit-broken
         mapping(address => uint256) strategyLastValue;
-        uint16 strategyMaxDeltaBps;
 
-        // ============================ router ====================================
+        // ═══════════════════════ router ══════════════════════════════════════════
         mapping(bytes4 => address) selectorToFacet;
 
         // ------- APPEND NEW STORAGE BELOW THIS LINE ONLY -------
@@ -150,14 +140,6 @@ library VaultStorage {
 //////////////////////////////////////////////////////////////////////////*/
 /**
  * @notice Shared access-control + reentrancy modifiers for every facet.
- *
- *  Facets are stateless logic delegatecalled by the `Vault`, so `address(this)`
- *  inside a facet is the vault instance and `VaultStorage.vaultLayout()` resolves to
- *  THAT vault's storage. These modifiers read roles straight out of it.
- *
- *  The reentrancy lock is a single shared storage flag (not per-facet), because
- *  every facet delegatecalls into the SAME storage — the lock must live at one
- *  fixed slot the whole vault agrees on.
  */
 abstract contract VaultModifiers {
     modifier onlyGovernance() {
@@ -180,11 +162,19 @@ abstract contract VaultModifiers {
         _;
     }
 
+    modifier whenPaused() {
+        require(VaultStorage.vaultLayout().paused, "NOT_PAUSED");
+        _;
+    }
+
+    /// @dev OZ-style lock: a full word toggled 2<->1 (never 0), so each write is a
+    ///      clean SSTORE with no bit-masking and never pays the zero->nonzero price.
+    ///      `reentrancyStatus` is seeded to 1 in the Vault constructor.
     modifier nonReentrant() {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
-        require(!s.reentrancyLocked, "REENTRANCY");
-        s.reentrancyLocked = true;
+        require(s.reentrancyStatus != 2, "REENTRANCY");
+        s.reentrancyStatus = 2;
         _;
-        s.reentrancyLocked = false;
+        s.reentrancyStatus = 1;
     }
 }
