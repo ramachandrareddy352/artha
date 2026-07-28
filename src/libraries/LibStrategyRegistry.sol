@@ -103,7 +103,7 @@ library LibStrategyRegistry {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(strategy != address(0), "ZERO_ADDRESS");
         require(IStrategy(strategy).vault() == address(this), "STRATEGY_VAULT_MISMATCH");
-        require(IStrategy(strategy).asset() == IERC20(s.baseAsset), "STRATEGY_ASSET_MISMATCH");
+        require(address(IStrategy(strategy).asset()) == s.baseAsset, "STRATEGY_ASSET_MISMATCH");
 
         address[] storage list = s.strategies;
         for (uint256 i; i < list.length; i++) {
