@@ -5,7 +5,7 @@ import {VaultStorage, BPS_DENOMINATOR, MAX_IDLE_BPS, MAX_STRATEGIES_PER_VAULT} f
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
- 
+
 /**
  * @title  LibStrategyRegistry
  * @notice Add / disable / remove / migrate this vault's strategies, set target
@@ -36,7 +36,6 @@ import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/Safe
 library LibStrategyRegistry {
     using SafeERC20 for IERC20;
 
-    event StrategyAdded(address indexed strategy, uint16 weightBps);
     event StrategyDisabledSet(address indexed strategy, bool disabled);
     event StrategyRemoved(address indexed strategy, uint256 dustWrittenOff);
     event StrategyMigrated(address indexed from, address indexed to, uint256 movedAssets);
@@ -118,7 +117,6 @@ library LibStrategyRegistry {
         require(list.length < MAX_STRATEGIES_PER_VAULT, "MAX_STRATEGIES");
 
         list.push(strategy);
-        emit StrategyAdded(strategy, 0);
 
         setTargets(allStrategies, allWeightsBps, idleTargetBps);
     }

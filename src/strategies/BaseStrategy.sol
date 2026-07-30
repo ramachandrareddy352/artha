@@ -144,7 +144,7 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
     }
 
     // ─────────────────────────────── views ──────────────────────────────────────
-
+ 
     function positionValue() public view override returns (uint256) {
         return _positionValue() + _pendingRewardsValue();
     }

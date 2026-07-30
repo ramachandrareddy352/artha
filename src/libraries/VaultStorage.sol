@@ -76,7 +76,7 @@ library VaultStorage {
     ///      masked to a 256-aligned slot.
     bytes32 internal constant STORAGE_SLOT =
         keccak256(abi.encode(uint256(keccak256("artha.vault.storage")) - 1)) & ~bytes32(uint256(0xff));
-
+ 
     struct Layout {
         address shareToken; // 20B — this vault's own share ERC-20 (mint/burn by this vault)
         uint8 baseDecimals; //  1B

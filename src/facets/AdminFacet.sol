@@ -28,12 +28,13 @@ contract AdminFacet is VaultModifiers {
     event KeeperSet(address indexed who, bool isKeeper);
     event GuardianSet(address indexed who, bool isGuardian);
     event TreasurySet(address oldTreasury, address newTreasury);
+    event GovernanceTransferred(address oldGovernance, address newGovernance);
     event IdleTargetSet(uint16 bps);
     event EntryFeeSet(uint96 oldWei, uint96 newWei);
     event EthFeesWithdrawn(address indexed to, uint256 amount);
 
     // ═══════════════════════════ strategy lifecycle ══════════════════════════════
-
+ 
     function addStrategy(
         address strategy,
         address[] calldata allStrategies,
@@ -100,9 +101,7 @@ contract AdminFacet is VaultModifiers {
     /// @notice Change the performance fee. Crystallizes ALL profit accrued so far at
     ///         the OLD rate FIRST (via refreshNav -> chargePerformanceFee, which mints
     ///         the treasury's shares and ratchets the HWM to the current price), then
-    ///         applies the new rate — so the new rate can never reach back over old
-    ///         gains. This is the fair, Yearn-style ordering (a fee change only ever
-    ///         affects profit earned from here on).
+    ///         applies the new rate — so the new rate can never reach back over old gains.
     function setPerformanceFee(uint16 bps) external onlyGovernance nonReentrant {
         require(bps <= MAX_PERFORMANCE_FEE_BPS, "FEE_TOO_HIGH");
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
@@ -169,6 +168,8 @@ contract AdminFacet is VaultModifiers {
 
     function transferGovernance(address newGovernance) external onlyGovernance {
         require(newGovernance != address(0), "ZERO_ADDRESS");
-        VaultStorage.vaultLayout().governance = newGovernance;
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        emit GovernanceTransferred(s.governance, newGovernance);
+        s.governance = newGovernance;
     }
 }

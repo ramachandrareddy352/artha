@@ -26,11 +26,11 @@ import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/Safe
  */
 contract DepositFacet is VaultModifiers {
     using SafeERC20 for IERC20;
-
+ 
     event Deposited(address indexed payer, address indexed receiver, uint256 assets, uint256 shares, uint256 pricePerShare);
     event EntryFeeCollected(address indexed payer, uint256 amount);
 
-    function deposit(uint256 assets, address receiver, uint256 minSharesOut, uint256 deadline)
+    function deposit(uint256 assets, address receiver, uint256 minSharesOut)
         external
         payable
         nonReentrant
@@ -38,7 +38,6 @@ contract DepositFacet is VaultModifiers {
         returns (uint256 shares)
     {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
-        require(block.timestamp <= deadline, "EXPIRED");
         require(receiver != address(0), "ZERO_ADDRESS");
         require(assets != 0, "ZERO_ASSETS");
         require(assets >= s.minDeposit, "BELOW_MIN_DEPOSIT");
@@ -59,7 +58,7 @@ contract DepositFacet is VaultModifiers {
         emit Deposited(msg.sender, receiver, assets, shares, LibVaultMath.pricePerShare());
     }
 
-    function mint(uint256 shares, address receiver, uint256 maxAssetsIn, uint256 deadline)
+    function mint(uint256 shares, address receiver, uint256 maxAssetsIn)
         external
         payable
         nonReentrant
@@ -67,7 +66,6 @@ contract DepositFacet is VaultModifiers {
         returns (uint256 assets)
     {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
-        require(block.timestamp <= deadline, "EXPIRED");
         require(receiver != address(0), "ZERO_ADDRESS");
         require(shares != 0, "ZERO_SHARES");
 
