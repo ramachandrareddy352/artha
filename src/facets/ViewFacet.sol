@@ -144,4 +144,14 @@ contract ViewFacet is VaultModifiers {
     function treasury() external view returns (address) {
         return VaultStorage.vaultLayout().treasury;
     }
+
+    /// @notice The flat native-ETH toll charged per deposit/mint (0 = disabled).
+    function entryFeeWei() external view returns (uint256) {
+        return VaultStorage.vaultLayout().entryFeeWei;
+    }
+
+    /// @notice Protocol-owned ETH collected from tolls, withdrawable by governance.
+    function collectedEthFees() external view returns (uint256) {
+        return VaultStorage.vaultLayout().collectedEthFees;
+    }
 }

@@ -111,6 +111,10 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         require(assets != 0, "ZERO");
         asset.safeTransferFrom(vault, address(this), assets);
         _invest(assets);
+        // Return any base the venue didn't consume (rounding/min-deposit dust) so it
+        // stays as the vault's idle instead of stranding in this stateless executor.
+        uint256 dust = asset.balanceOf(address(this));
+        if (dust != 0) asset.safeTransfer(vault, dust);
         emit Invested(assets);
     }
 

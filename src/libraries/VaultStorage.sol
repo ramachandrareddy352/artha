@@ -32,6 +32,10 @@ uint256 constant PPS_SCALE = 1e18;
 // discretion). 3_000 = 30%.
 uint16 constant MAX_PERFORMANCE_FEE_BPS = 3_000;
 
+// Hard ceiling on the flat native-ETH entry fee, so governance can never set an
+// absurd toll. 0.1 ether.
+uint96 constant MAX_ENTRY_FEE_WEI = 0.1 ether;
+
 /*//////////////////////////////////////////////////////////////////////////
                                VAULT STORAGE
 //////////////////////////////////////////////////////////////////////////*/
@@ -112,6 +116,13 @@ library VaultStorage {
         uint192 depositFlowAmount;
         uint64 withdrawFlowBlock;
         uint192 withdrawFlowAmount;
+
+        // ═══════════════════════ native-ETH entry fee (packed pair, 28B) ═════════
+        // A flat ETH toll taken on every deposit/mint, pooled here as protocol-owned
+        // ETH and withdrawable only by governance. Kept entirely separate from the
+        // base-asset accounting above — user principal is never touched by it.
+        uint96 entryFeeWei; // flat toll per invest; 0 = disabled (msg.value must be 0)
+        uint128 collectedEthFees; // running total of tolls collected, admin-withdrawable
 
         // ═══════════════════════ strategies ══════════════════════════════════════
         address[] strategies; // priority order; withdrawal drains index 0 first

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VaultStorage, PPS_SCALE, DECIMALS_OFFSET, MAX_IDLE_BPS, MAX_PERFORMANCE_FEE_BPS, BPS_DENOMINATOR} from "./libraries/VaultStorage.sol";
+import {VaultStorage, PPS_SCALE, DECIMALS_OFFSET, MAX_IDLE_BPS, MAX_PERFORMANCE_FEE_BPS, MAX_ENTRY_FEE_WEI, BPS_DENOMINATOR} from "./libraries/VaultStorage.sol";
 import {VaultShareToken} from "./VaultShareToken.sol";
 import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
@@ -48,6 +48,7 @@ contract Vault {
         uint16 performanceFeeBps;
         uint16 strategyMaxDeltaBps;
         uint16 harvestMaxImpactBps;
+        uint96 entryFeeWei; // flat native-ETH toll per deposit/mint; 0 = disabled
         uint256 minDeposit;   // in terms of base asset, not shares
         uint256 tvlCap;
         uint256 depositCapPerBlock;
@@ -83,6 +84,7 @@ contract Vault {
         // Flow caps are tracked in a uint192-packed slot; bound the setters so the
         // cumulative downcast can never truncate (trivially true for any real cap).
         require(c.depositCapPerBlock <= type(uint192).max && c.withdrawCapPerBlock <= type(uint192).max, "CAP_TOO_HIGH");
+        require(c.entryFeeWei <= MAX_ENTRY_FEE_WEI, "ENTRY_FEE_TOO_HIGH");
 
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(!s.initialized, "ALREADY_INIT");
@@ -104,6 +106,7 @@ contract Vault {
         s.performanceFeeBps = c.performanceFeeBps;
         s.strategyMaxDeltaBps = c.strategyMaxDeltaBps;
         s.harvestMaxImpactBps = c.harvestMaxImpactBps;
+        s.entryFeeWei = c.entryFeeWei;
 
         // Seed the mark at the genesis price-per-share (see contract header).
         s.highWaterMarkPps = PPS_SCALE / (10 ** DECIMALS_OFFSET);
@@ -151,6 +154,8 @@ contract Vault {
         s.selectorToFacet[AdminFacet.setGuardian.selector] = f.admin;
         s.selectorToFacet[AdminFacet.setTreasury.selector] = f.admin;
         s.selectorToFacet[AdminFacet.transferGovernance.selector] = f.admin;
+        s.selectorToFacet[AdminFacet.setEntryFee.selector] = f.admin;
+        s.selectorToFacet[AdminFacet.withdrawEthFees.selector] = f.admin;
 
         // EmergencyFacet
         s.selectorToFacet[EmergencyFacet.pauseVault.selector] = f.emergency;
@@ -177,6 +182,8 @@ contract Vault {
         s.selectorToFacet[ViewFacet.isCapExempt.selector] = f.view_;
         s.selectorToFacet[ViewFacet.governance.selector] = f.view_;
         s.selectorToFacet[ViewFacet.treasury.selector] = f.view_;
+        s.selectorToFacet[ViewFacet.entryFeeWei.selector] = f.view_;
+        s.selectorToFacet[ViewFacet.collectedEthFees.selector] = f.view_;
     }
 
     // ═══════════════════════════ upgrades ═════════════════════════════════════════

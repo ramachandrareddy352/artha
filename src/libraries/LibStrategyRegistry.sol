@@ -5,7 +5,7 @@ import {VaultStorage, BPS_DENOMINATOR, MAX_IDLE_BPS, MAX_STRATEGIES_PER_VAULT} f
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
-
+ 
 /**
  * @title  LibStrategyRegistry
  * @notice Add / disable / remove / migrate this vault's strategies, set target
@@ -46,17 +46,23 @@ library LibStrategyRegistry {
     // ─────────────────────────── capital movement ───────────────────────────────
 
     /// @notice Approve `amount` of base to `strategy` and invest it, crediting the
-    ///         venue receipt to this vault. Updates idle + tracked value.
+    ///         venue receipt to this vault. Accounts by the ACTUAL base spent
+    ///         (balance-delta), so any un-deployed dust the strategy hands back
+    ///         simply stays as idle — idle and tracked value never over-count.
     function investInto(address strategy, uint256 amount) internal {
         if (amount == 0) return;
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
 
-        IERC20(s.baseAsset).forceApprove(strategy, amount);
+        uint256 beforeBal = base.balanceOf(address(this));
+        base.forceApprove(strategy, amount);
         IStrategy(strategy).invest(amount);
-        IERC20(s.baseAsset).forceApprove(strategy, 0);
+        base.forceApprove(strategy, 0);
+        // spent = amount pulled - any dust the strategy returned to the vault.
+        uint256 spent = beforeBal - base.balanceOf(address(this));
 
-        s.idleBalance -= amount;
-        s.strategyLastValue[strategy] += amount;
+        s.idleBalance -= spent;
+        s.strategyLastValue[strategy] += spent;
     }
 
     /// @notice Grant `strategy` transient receipt access, divest up to `amount`
@@ -138,7 +144,9 @@ library LibStrategyRegistry {
             sum += weightsBps[i];
             s.strategyWeightBps[strategies_[i]] = weightsBps[i];
         }
-        require(sum <= BPS_DENOMINATOR, "WEIGHTS_EXCEED_100");
+        // Must allocate EXACTLY 100%: idle target + every strategy weight sum to
+        // BPS_DENOMINATOR. Every add/reweight therefore restates a complete split.
+        require(sum == BPS_DENOMINATOR, "WEIGHTS_NOT_100");
 
         s.idleTargetBps = idleTargetBps;
         emit TargetsSet(strategies_, weightsBps, idleTargetBps);

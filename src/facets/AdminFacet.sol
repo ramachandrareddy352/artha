@@ -6,7 +6,8 @@ import {
     VaultModifiers,
     BPS_DENOMINATOR,
     MAX_IDLE_BPS,
-    MAX_PERFORMANCE_FEE_BPS
+    MAX_PERFORMANCE_FEE_BPS,
+    MAX_ENTRY_FEE_WEI
 } from "../libraries/VaultStorage.sol";
 import {LibStrategyRegistry} from "../libraries/LibStrategyRegistry.sol";
 import {LibVaultNav} from "../libraries/LibVaultNav.sol";
@@ -28,6 +29,8 @@ contract AdminFacet is VaultModifiers {
     event GuardianSet(address indexed who, bool isGuardian);
     event TreasurySet(address oldTreasury, address newTreasury);
     event IdleTargetSet(uint16 bps);
+    event EntryFeeSet(uint96 oldWei, uint96 newWei);
+    event EthFeesWithdrawn(address indexed to, uint256 amount);
 
     // ═══════════════════════════ strategy lifecycle ══════════════════════════════
 
@@ -94,12 +97,41 @@ contract AdminFacet is VaultModifiers {
         emit IdleTargetSet(bps);
     }
 
-    function setPerformanceFee(uint16 bps) external onlyGovernance {
+    /// @notice Change the performance fee. Crystallizes ALL profit accrued so far at
+    ///         the OLD rate FIRST (via refreshNav -> chargePerformanceFee, which mints
+    ///         the treasury's shares and ratchets the HWM to the current price), then
+    ///         applies the new rate — so the new rate can never reach back over old
+    ///         gains. This is the fair, Yearn-style ordering (a fee change only ever
+    ///         affects profit earned from here on).
+    function setPerformanceFee(uint16 bps) external onlyGovernance nonReentrant {
         require(bps <= MAX_PERFORMANCE_FEE_BPS, "FEE_TOO_HIGH");
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        LibVaultNav.refreshNav(); // settle at the OLD rate before switching
         uint16 old = s.performanceFeeBps;
         s.performanceFeeBps = bps;
         emit PerformanceFeeSet(old, bps);
+    }
+
+    // ═══════════════════════════ native-ETH entry fee ══════════════════════════════
+
+    /// @notice Set the flat ETH toll charged on every deposit/mint. 0 disables it.
+    function setEntryFee(uint96 feeWei) external onlyGovernance {
+        require(feeWei <= MAX_ENTRY_FEE_WEI, "ENTRY_FEE_TOO_HIGH");
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        emit EntryFeeSet(s.entryFeeWei, feeWei);
+        s.entryFeeWei = feeWei;
+    }
+
+    /// @notice Withdraw protocol-owned ETH tolls. Bounded by `collectedEthFees` so it
+    ///         can NEVER touch user base-asset principal.
+    function withdrawEthFees(address to, uint256 amount) external onlyGovernance nonReentrant {
+        require(to != address(0), "ZERO_ADDRESS");
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        require(amount != 0 && amount <= s.collectedEthFees, "BAD_AMOUNT");
+        s.collectedEthFees -= uint128(amount);
+        (bool ok,) = to.call{value: amount}("");
+        require(ok, "ETH_TRANSFER_FAILED");
+        emit EthFeesWithdrawn(to, amount);
     }
 
     /// @dev 0 is rejected — 0 would silently disable the breaker. Use
