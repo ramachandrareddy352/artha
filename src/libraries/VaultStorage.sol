@@ -93,7 +93,7 @@ library VaultStorage {
         // ═══════════════════════ roles / exemptions (mappings) ═══════════════════
         mapping(address => bool) isKeeper;
         mapping(address => bool) isGuardian;
-        mapping(address => bool) isCapExempt;
+        mapping(address => bool) isCapExempt;   // used for other protocols want to invest in our protocol
 
         // ═══════════════════════ balances / NAV (hot writes, own slot) ═══════════
         uint256 idleBalance; // base held by this vault, un-deployed

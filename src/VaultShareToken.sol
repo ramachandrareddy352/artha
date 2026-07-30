@@ -10,25 +10,25 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
  *
  *  Decimals are fixed at 18 regardless of the base asset's own decimals
  * 
- *  `vault` is immutable and set once at deployment (the deploying Vault). Facet
+ *  `i_vault` is immutable and set once at deployment (the deploying Vault). Facet
  *  logic runs via `delegatecall` through the Vault, so any facet calling
- *  `mint`/`burn`/`spendAllowance` does so with `msg.sender == vault` regardless
+ *  `mint`/`burn`/`spendAllowance` does so with `msg.sender == i_vault` regardless
  *  of which facet triggered it.
  */
 contract VaultShareToken is ERC20 {
-    address public immutable vault;
+    address public immutable i_vault;
 
     event Minted(address indexed to, uint256 amount);
     event Burned(address indexed from, uint256 amount);
 
     modifier onlyVault() {
-        require(msg.sender == vault, "NOT_VAULT");
+        require(msg.sender == i_vault, "NOT_VAULT");
         _;
     }
 
     constructor(address _vault, string memory _name, string memory _symbol) ERC20(_name, _symbol) {
         require(_vault != address(0), "ZERO_ADDRESS");
-        vault = _vault;
+        i_vault = _vault;
     }
 
     function mint(address to, uint256 amount) external onlyVault {
