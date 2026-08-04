@@ -6,34 +6,11 @@ import "./sources/PythSource.sol";
 
 /**
  * @title  PriceFeed
- * @notice Multi-source price oracle. Every price returned is 8-decimal USD, matching
- *         Chainlink's own convention -- registered feeds are trusted to already
- *         report at that precision (see ChainlinkSource / PythSource).
- *
+ * @notice Multi-source price oracle. Every price returned is 8-decimal USD
  *  Per token, per source, the admin registers a config (feed address / price id +
  *  a staleness bound). `getPrice(token)` with no source defaults to CHAINLINK;
  *  `getPrice(token, source)` reads a specific source explicitly. Sources never blend
  *  or cross-check each other automatically -- the caller picks one.
- *
- *  ═══════════════════════════════════════════════════════════════════════════
- *   ADDING A SOURCE LATER (DEX / LP / RWA / ...)
- *  ═══════════════════════════════════════════════════════════════════════════
- *
- *  1. Append a value to PriceSource -- append ONLY, never reorder or remove existing
- *     entries. Their integer position is load-bearing the moment anything has been
- *     configured against them.
- *  2. Write a new sources/XSource.sol mixin (internal getXPrice(...) -> uint256,
- *     8dp), and inherit it here.
- *  3. Add its config mapping + admin setter/deleter, same shape as the Chainlink and
- *     Pyth ones below.
- *  4. Add its case to `_getPrice`.
- *
- *  A derived-price source (an LP token, for instance) needs the price of its own
- *  underlying tokens, not just one external call -- that's exactly what `_getPrice`
- *  is for: it's `internal`, so a future LP source mixin can call straight back into
- *  it for each underlying token, in the same contract, with no external call and no
- *  reentrancy surface. This is why the dispatch core is kept separate from the
- *  external `getPrice()` overloads instead of being inlined into them.
  */
 contract PriceFeed is ChainlinkSource, PythSource {
     enum PriceSource {

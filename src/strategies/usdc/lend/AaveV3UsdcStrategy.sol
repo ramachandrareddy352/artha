@@ -11,7 +11,7 @@ interface IAaveV3Pool {
     function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
     function withdraw(address asset, uint256 amount, address to) external returns (uint256);
 }
-
+ 
 /// @notice Aave V3 liquidity-mining controller (optional; many markets have none).
 ///         `claimAllRewardsOnBehalf` claims a user's accrued rewards to `to`, and
 ///         requires the caller to be an authorized claimer set by that user.
@@ -93,7 +93,7 @@ contract AaveV3UsdcStrategy is BaseStrategy {
             _sellReward(rewards[i], amounts[i]);
         }
     }
-
+ 
     function _sellReward(address reward, uint256 amount) internal {
         uint256 minOut = _valueInAsset(reward, amount, IERC20MetadataLike(reward).decimals());
         IERC20(reward).forceApprove(address(swapper), amount);

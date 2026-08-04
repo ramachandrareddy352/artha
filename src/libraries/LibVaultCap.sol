@@ -9,7 +9,7 @@ import {VaultStorage} from "./VaultStorage.sol";
  *         overall TVL cap. A TVL cap bounds how big the vault gets; this bounds
  *         how FAST value can move in or out in one block — the defense against a
  *         single-block attack or a bank-run cascade.
- *
+ * 
  *  Deposit and withdraw each have their own cap, tracked CUMULATIVELY across
  *  every caller in the same block (a per-tx-only cap is trivially split across
  *  transactions in one block). A transaction that would push the block's

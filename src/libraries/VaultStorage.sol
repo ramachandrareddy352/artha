@@ -36,6 +36,18 @@ uint16 constant MAX_PERFORMANCE_FEE_BPS = 3_000;
 // absurd toll. 0.1 ether.
 uint96 constant MAX_ENTRY_FEE_WEI = 0.1 ether;
 
+// Window over which a strategy accrues its FULL `strategyMaxDeltaBps` of movement
+// allowance in the NAV circuit breaker. A refresh sooner than this gets a
+// pro-rata slice of the allowance, so splitting one large move into many small
+// refreshes buys NO extra headroom — the breaker limits movement per unit TIME,
+// not per call, and the caller no longer controls the budget by choosing cadence.
+uint256 constant DELTA_ALLOWANCE_WINDOW = 1 hours;
+
+// How far a governance-confirmed circuit-breaker re-anchor may sit from the
+// strategy's own live reading. Bounds `clearStrategyCircuitBreak` so a fat-finger
+// can never mint NAV out of thin air. 500 = 5%.
+uint16 constant CLEAR_ANCHOR_TOLERANCE_BPS = 500;
+
 /*//////////////////////////////////////////////////////////////////////////
                                VAULT STORAGE
 //////////////////////////////////////////////////////////////////////////*/
@@ -86,7 +98,7 @@ library VaultStorage {
         uint16 harvestMaxImpactBps; //  2B
         bool paused; //  1B — read first by whenNotPaused, warms the whole slot
         bool initialized; //  1B — set once at init, prevents re-initialization
-
+ 
         /// @notice 1 = not entered, 2 = entered. 
         uint256 reentrancyStatus;
 
@@ -135,7 +147,14 @@ library VaultStorage {
         mapping(bytes4 => address) selectorToFacet;
 
         // ------- APPEND NEW STORAGE BELOW THIS LINE ONLY -------
-        uint256[50] __gap;
+
+        /// @notice When each strategy's `strategyLastValue` was last ANCHORED (a
+        ///         keeper/user-driven refresh, a governance re-anchor, or an
+        ///         invest/divest). The circuit breaker scales its allowance by the
+        ///         time since this stamp — see DELTA_ALLOWANCE_WINDOW.
+        mapping(address => uint256) strategyLastRefresh;
+
+        uint256[49] __gap;
     }
 
     function vaultLayout() internal pure returns (Layout storage s) {

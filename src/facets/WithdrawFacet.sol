@@ -45,7 +45,9 @@ contract WithdrawFacet is VaultModifiers {
         require(receiver != address(0) && owner != address(0), "ZERO_ADDRESS");
         require(assets != 0, "ZERO_ASSETS");
 
-        if (assets > s.idleBalance) _harvestAllActive(s);
+        if (assets > s.idleBalance) {
+            _harvestAllActive(s);
+        }
         LibVaultNav.refreshNav();
 
         shares = LibVaultMath.convertToSharesUp(assets);
@@ -135,7 +137,7 @@ contract WithdrawFacet is VaultModifiers {
             VaultShareToken(s.shareToken).spendAllowance(owner, msg.sender, shares);
         }
         VaultShareToken(s.shareToken).burn(owner, shares);
-
+ 
         IERC20(s.baseAsset).safeTransfer(receiver, assets);
     }
 }

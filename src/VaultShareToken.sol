@@ -44,7 +44,7 @@ contract VaultShareToken is ERC20 {
     /// @notice Decrement `owner`'s allowance for `spender` by `amount`, letting the
     ///         vault honor the ERC-4626 "withdraw on behalf of an owner via
     ///         allowance" pattern even though `burn` bypasses `transferFrom`.
-    ///         Infinite approvals are left untouched, matching OZ's behavior.
+    ///         Only at emergency time and authorized can call this.
     function spendAllowance(address owner, address spender, uint256 amount) external onlyVault {
         _spendAllowance(owner, spender, amount);
     }

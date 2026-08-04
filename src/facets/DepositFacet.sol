@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {VaultStorage, VaultModifiers} from "../libraries/VaultStorage.sol";
 import {LibVaultMath} from "../libraries/LibVaultMath.sol";
 import {LibVaultNav} from "../libraries/LibVaultNav.sol";
-import {LibVaultCap} from "../libraries/LibVaultCap.sol";
+import {LibVaultCap} from "../libraries/LibVaultCap.sol"; 
 import {VaultShareToken} from "../VaultShareToken.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";

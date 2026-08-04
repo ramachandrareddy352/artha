@@ -68,7 +68,7 @@ contract EmergencyFacet is VaultModifiers {
             VaultShareToken(s.shareToken).spendAllowance(owner, msg.sender, shares);
         }
         VaultShareToken(s.shareToken).burn(owner, shares);
-
+ 
         // Gather up to `entitlement`: idle first, then unwind strategies best-effort.
         if (s.idleBalance < entitlement) {
             address[] storage strats = s.strategies;

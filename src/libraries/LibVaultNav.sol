@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VaultStorage, BPS_DENOMINATOR} from "./VaultStorage.sol";
+import {VaultStorage, BPS_DENOMINATOR, DELTA_ALLOWANCE_WINDOW} from "./VaultStorage.sol";
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {LibVaultFee} from "./LibVaultFee.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
