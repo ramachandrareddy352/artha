@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VaultStorage, BPS_DENOMINATOR, MAX_IDLE_BPS, MAX_STRATEGIES_PER_VAULT} from "./VaultStorage.sol";
+import {
+    VaultStorage,
+    BPS_DENOMINATOR,
+    MAX_IDLE_BPS,
+    MAX_STRATEGIES_PER_VAULT,
+    CLEAR_ANCHOR_TOLERANCE_BPS
+} from "./VaultStorage.sol";
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -40,9 +46,39 @@ library LibStrategyRegistry {
     event StrategyRemoved(address indexed strategy, uint256 dustWrittenOff);
     event StrategyMigrated(address indexed from, address indexed to, uint256 movedAssets);
     event TargetsSet(address[] strategies, uint16[] weightsBps, uint16 idleTargetBps);
-    event StrategyCircuitCleared(address indexed strategy);
+    event StrategyCircuitCleared(address indexed strategy, uint256 confirmedValue);
+    event StrategyHarvestCredited(address indexed strategy, uint256 realized);
+    event StrategyDivestFailed(address indexed strategy);
 
     // ─────────────────────────── capital movement ───────────────────────────────
+
+    /// @notice Harvest `strategy`, crediting the base it actually delivered into idle.
+    ///
+    ///         Accounts by BALANCE-DELTA on the vault, never by the strategy's return
+    ///         value. Harvest proceeds land in the vault as a plain ERC-20 transfer, so
+    ///         the vault's own balance movement is the only trustworthy measure of what
+    ///         arrived — a returned number is just a claim. This is the single place
+    ///         harvest is accounted for; every caller routes through it so none of them
+    ///         can forget to credit idle (they used to, in `removeStrategy` /
+    ///         `migrateStrategy`, which silently left the proceeds outside NAV).
+    /// @return ok       False if the harvest reverted. Nothing is credited in that case.
+    /// @return realized Base actually delivered to the vault.
+    function harvestInto(address strategy) internal returns (bool ok, uint256 realized) {
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
+
+        uint256 beforeBal = base.balanceOf(address(this));
+        try IStrategy(strategy).harvest() {
+            realized = base.balanceOf(address(this)) - beforeBal;
+            if (realized != 0) {
+                s.idleBalance += realized;
+                emit StrategyHarvestCredited(strategy, realized);
+            }
+            ok = true;
+        } catch {
+            ok = false;
+        }
+    }
 
     /// @notice Approve `amount` of base to `strategy` and invest it, crediting the
     ///         venue receipt to this vault. Accounts by the ACTUAL base spent
@@ -62,39 +98,90 @@ library LibStrategyRegistry {
 
         s.idleBalance -= spent;
         s.strategyLastValue[strategy] += spent;
+        s.strategyLastRefresh[strategy] = block.timestamp;
     }
 
     /// @notice Grant `strategy` transient receipt access, divest up to `amount`
     ///         base back into the vault, and return what was actually freed.
     ///         Keeps the circuit-breaker cache honest by decrementing tracked value.
+    /// @dev    `freed` is the vault's BALANCE-DELTA, not the strategy's return value —
+    ///         same reasoning as `harvestInto`. Reverts if the venue does; use
+    ///         `tryDivestFrom` where a failure must not take the caller down with it.
     function divestFrom(address strategy, uint256 amount) internal returns (uint256 freed) {
         if (amount == 0) return 0;
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
 
         address receipt = IStrategy(strategy).receiptToken();
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
-        freed = IStrategy(strategy).divest(amount);
+        uint256 beforeBal = base.balanceOf(address(this));
+        IStrategy(strategy).divest(amount);
+        freed = base.balanceOf(address(this)) - beforeBal;
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
 
-        if (freed != 0) {
-            s.idleBalance += freed;
-            uint256 last = s.strategyLastValue[strategy];
-            s.strategyLastValue[strategy] = freed >= last ? 0 : last - freed;
+        _creditDivest(s, strategy, freed);
+    }
+
+    /// @notice Best-effort `divestFrom`: a venue that reverts contributes 0 instead of
+    ///         reverting the caller.
+    ///
+    ///         This is what the withdrawal queue must use. A venue in a paused or
+    ///         frozen state — Aave freeze, Compound pause, Euler pause, all ordinary
+    ///         venue states a CORRECT strategy will faithfully revert on — would
+    ///         otherwise propagate out of the drain loop and brick every `withdraw`
+    ///         and `redeem` in the vault, leaving users only the lossy emergency exit.
+    function tryDivestFrom(address strategy, uint256 amount) internal returns (uint256 freed) {
+        if (amount == 0) return 0;
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
+
+        address receipt;
+        try IStrategy(strategy).receiptToken() returns (address r) {
+            receipt = r;
+        } catch {
+            emit StrategyDivestFailed(strategy);
+            return 0;
         }
+
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
+        uint256 beforeBal = base.balanceOf(address(this));
+        try IStrategy(strategy).divest(amount) {
+            freed = base.balanceOf(address(this)) - beforeBal;
+        } catch {
+            emit StrategyDivestFailed(strategy);
+        }
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
+
+        _creditDivest(s, strategy, freed);
     }
 
     /// @notice Fully unwind a strategy's position to base (emergency path — no
     ///         harvest, no slippage bound), crediting the proceeds to idle.
     function fullExit(address strategy) internal returns (uint256 freed) {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
 
         address receipt = IStrategy(strategy).receiptToken();
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
-        freed = IStrategy(strategy).emergencyWithdraw();
+        uint256 beforeBal = base.balanceOf(address(this));
+        IStrategy(strategy).emergencyWithdraw();
+        freed = base.balanceOf(address(this)) - beforeBal;
         if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
 
         if (freed != 0) s.idleBalance += freed;
         s.strategyLastValue[strategy] = 0;
+        s.strategyLastRefresh[strategy] = block.timestamp;
+    }
+
+    /// @dev Book a divest: idle up, tracked value down, breaker anchor re-stamped so
+    ///      the next refresh measures its allowance from NOW rather than from a stale
+    ///      timestamp that would grant a larger-than-intended budget.
+    function _creditDivest(VaultStorage.Layout storage s, address strategy, uint256 freed) private {
+        if (freed == 0) return;
+        s.idleBalance += freed;
+        uint256 last = s.strategyLastValue[strategy];
+        s.strategyLastValue[strategy] = freed >= last ? 0 : last - freed;
+        s.strategyLastRefresh[strategy] = block.timestamp;
     }
 
     // ─────────────────────────── registry ───────────────────────────────────────
@@ -157,11 +244,47 @@ library LibStrategyRegistry {
         emit StrategyDisabledSet(strategy, disabled);
     }
 
-    function clearCircuitBreak(address strategy) internal {
+    /// @notice Clear a strategy's circuit break, RE-ANCHORING its tracked value to a
+    ///         governance-confirmed figure.
+    ///
+    ///         The re-anchor is not optional. The breaker tripped precisely because
+    ///         `|positionValue - strategyLastValue| > allowance`; clearing the flag
+    ///         without moving the anchor leaves that inequality intact, so the very
+    ///         next refresh — including one triggered by any user's deposit in the
+    ///         same block — re-trips it immediately. Without this parameter there is
+    ///         no way anywhere in the vault to say "we investigated, the move was
+    ///         real, resume", and the strategy is permanently unusable.
+    ///
+    /// @param confirmedValue The value governance has verified. Bounded to within
+    ///        CLEAR_ANCHOR_TOLERANCE_BPS of the strategy's own live reading so this
+    ///        can never be used to mint NAV. If the position cannot be read at all
+    ///        there is no ground truth to check against, so clearing is refused —
+    ///        `removeStrategy` is the correct path for a venue that stays dark.
+    function clearCircuitBreak(address strategy, uint256 confirmedValue) internal {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
         require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
+        require(s.strategyBroken[strategy], "NOT_BROKEN");
+
+        uint256 live;
+        try IStrategy(strategy).positionValue() returns (uint256 v) {
+            live = v;
+        } catch {
+            revert("POSITION_READ_FAILED");
+        }
+
+        uint256 diff = confirmedValue > live ? confirmedValue - live : live - confirmedValue;
+        require(diff <= (live * CLEAR_ANCHOR_TOLERANCE_BPS) / BPS_DENOMINATOR, "ANCHOR_OUT_OF_BAND");
+
+        s.strategyLastValue[strategy] = confirmedValue;
+        s.strategyLastRefresh[strategy] = block.timestamp;
         s.strategyBroken[strategy] = false;
-        emit StrategyCircuitCleared(strategy);
+        emit StrategyCircuitCleared(strategy, confirmedValue);
+    }
+
+    /// @notice Is `strategy` registered with this vault? Exposed so facets can reject
+    ///         calls naming an address the vault has never adopted.
+    function isKnown(address strategy) internal view returns (bool) {
+        return _isKnown(VaultStorage.vaultLayout(), strategy);
     }
 
     /// @notice Fully unwind and drop a strategy. Harvests (hard revert on failure
@@ -172,9 +295,12 @@ library LibStrategyRegistry {
         require(_isKnown(s, strategy), "UNKNOWN_STRATEGY");
 
         if (!s.strategyBroken[strategy]) {
-            try IStrategy(strategy).harvest() {} catch {
-                revert("HARVEST_FAILED");
-            }
+            // Credit what the harvest actually delivered. Dropping it here used to
+            // leave the proceeds sitting in the vault outside `idleBalance`, so the
+            // refreshNav that follows priced every holder against a NAV short by
+            // exactly that amount until someone happened to call `sync()`.
+            (bool ok,) = harvestInto(strategy);
+            require(ok, "HARVEST_FAILED");
         }
 
         fullExit(strategy);
@@ -188,6 +314,7 @@ library LibStrategyRegistry {
         delete s.strategyDisabled[strategy];
         delete s.strategyBroken[strategy];
         delete s.strategyLastValue[strategy];
+        delete s.strategyLastRefresh[strategy];
 
         emit StrategyRemoved(strategy, dust);
     }
@@ -206,9 +333,11 @@ library LibStrategyRegistry {
         }
 
         if (!s.strategyBroken[from]) {
-            try IStrategy(from).harvest() {} catch {
-                revert("HARVEST_FAILED");
-            }
+            // See removeStrategy: credit the proceeds. Beyond the NAV understatement,
+            // dropping them here also meant the harvested base was never carried into
+            // the replacement strategy — it silently became idle drag.
+            (bool ok,) = harvestInto(from);
+            require(ok, "HARVEST_FAILED");
         }
         uint256 freed = fullExit(from);
 
@@ -219,6 +348,7 @@ library LibStrategyRegistry {
         delete s.strategyDisabled[from];
         delete s.strategyBroken[from];
         delete s.strategyLastValue[from];
+        delete s.strategyLastRefresh[from];
 
         list.push(to);
         s.strategyWeightBps[to] = weight;

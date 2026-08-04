@@ -214,6 +214,27 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
         emit Unstaked(vault, msg.sender, amount, pos.shares);
     }
 
+    /**
+     * @notice Withdraw the caller's ENTIRE stake without touching the accrual math.
+     *         The escape hatch: staked principal is never hostage to the reward index.
+     *
+     * @dev    Deliberately does not call `_settle`, does not read `_currentAcc`, and is
+     *         not `whenNotPaused` — those are exactly the things that can be wedged.
+     *         Unsettled accrual is FORFEITED (already-settled `earnedArtha` stays
+     *         claimable); leaving `rewardDebt` stale is safe because `_accruedSince`
+     *         returns 0 once `shares` is 0, and any future `stake()` re-stamps it.
+     */
+    function emergencyUnstake(address vault) external nonReentrant {
+        Position storage pos = _position[vault][msg.sender];
+        uint256 amount = pos.shares;
+        require(amount != 0, "NO_STAKE");
+
+        pos.shares = 0;
+
+        IERC20(_vaultInfo[vault].shareToken).safeTransfer(msg.sender, amount);
+        emit Unstaked(vault, msg.sender, amount, 0);
+    }
+
     // ═════════════════════════════ claiming ═════════════════════════════════════
 
     /// @notice Claim all ARTHA earned by the caller's own position in `vault`.

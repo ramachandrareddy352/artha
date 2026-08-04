@@ -95,12 +95,9 @@ contract WithdrawFacet is VaultModifiers {
         for (uint256 i; i < n; i++) {
             address strat = strats[i];
             if (s.strategyBroken[strat]) continue;
-            try IStrategy(strat).harvest() returns (uint256 realized) {
-                if (realized != 0) {
-                    // harvested base landed in the vault as idle; account for it.
-                    s.idleBalance += realized;
-                }
-            } catch {}
+            // Credits the vault's measured balance delta into idle; a failure is
+            // skipped rather than propagated.
+            LibStrategyRegistry.harvestInto(strat);
         }
     }
 
@@ -117,7 +114,10 @@ contract WithdrawFacet is VaultModifiers {
             for (uint256 i; i < n && remaining != 0; i++) {
                 address strat = strats[i];
                 if (s.strategyBroken[strat]) continue;
-                uint256 freed = LibStrategyRegistry.divestFrom(strat, remaining);
+                // Best-effort: one venue that reverts must not brick the whole queue.
+                // The shortfall check below still reverts the transaction if the full
+                // amount cannot be produced, so this never pays out a partial exit.
+                uint256 freed = LibStrategyRegistry.tryDivestFrom(strat, remaining);
                 remaining -= freed < remaining ? freed : remaining;
             }
             require(remaining == 0, "INSUFFICIENT_LIQUIDITY");

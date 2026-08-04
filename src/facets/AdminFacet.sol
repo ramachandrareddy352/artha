@@ -56,8 +56,21 @@ contract AdminFacet is VaultModifiers {
         LibStrategyRegistry.setDisabled(strategy, disabled);
     }
 
-    function clearStrategyCircuitBreak(address strategy) external onlyGovernance {
-        LibStrategyRegistry.clearCircuitBreak(strategy);
+    /// @notice Clear a strategy's circuit break, re-anchoring its tracked value to
+    ///         `confirmedValue`. The anchor is mandatory — clearing the flag alone
+    ///         leaves the very condition that tripped the breaker in place, so the
+    ///         next NAV refresh (any user's deposit will do) re-trips it immediately.
+    ///         `confirmedValue` is bounded against the strategy's live reading.
+    ///
+    ///         Does NOT unpause. If the break auto-paused the vault, governance
+    ///         unpauses separately via `EmergencyFacet.unpauseVault` once satisfied.
+    function clearStrategyCircuitBreak(address strategy, uint256 confirmedValue)
+        external
+        onlyGovernance
+        nonReentrant
+    {
+        LibStrategyRegistry.clearCircuitBreak(strategy, confirmedValue);
+        LibVaultNav.refreshNav();
     }
 
     function removeStrategy(address strategy, uint256 dustFloor) external onlyGovernance nonReentrant {

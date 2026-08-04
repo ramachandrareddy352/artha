@@ -61,6 +61,23 @@ import "./UserRewardManager.sol";
  */
 contract UserRewardSystem is UserRewardManager {
     /**
+     * @notice Hard ceiling on a vault's reward rate: 1 ARTHA per share per second.
+     *
+     *  Unbounded, this parameter is a one-way brick. The index advances as
+     *  `accRewardPerShare += rewardRate * elapsed`, and that product is read on EVERY
+     *  path — `_currentAcc` feeds `_accruedSince`, which `_settle` runs as the first
+     *  statement of stake, unstake AND claim. A rate near `type(uint256).max` overflows
+     *  one second later and reverts all three forever. The repair is dead too:
+     *  `setRewardRate(0)` calls `_advanceAcc` first, which computes the same overflowing
+     *  product. Every staked share would be locked permanently, and it needs no malice —
+     *  a per-year figure pasted into a per-second field is enough.
+     *
+     *  1e18/share/second is already absurd (a single share earns 86,400 ARTHA a day),
+     *  so this bounds the damage without constraining any real emission schedule.
+     */
+    uint256 public constant MAX_REWARD_RATE = 1e18;
+
+    /**
      * @notice One user's staked position in one vault.
      * @param shares            Shares currently staked, 1e18 fixed point.
      * @param rewardDebt        accRewardPerShare snapshot at this position's last
@@ -160,6 +177,7 @@ contract UserRewardSystem is UserRewardManager {
     /// @dev Set a vault's reward rate. Public entry point lives in
     ///      UserRewardVault.setRewardRate() (also used by registerVault()).
     function _setRewardRate(address _vault, uint256 _newRate) internal {
+        require(_newRate <= MAX_REWARD_RATE, "RATE_TOO_HIGH");
         _advanceAcc(_vault);
         Emission storage e = _emission[_vault];
         uint256 old = e.rewardRate;

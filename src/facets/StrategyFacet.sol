@@ -25,11 +25,21 @@ contract StrategyFacet is VaultModifiers {
 
     // ═══════════════════════════════ harvest ══════════════════════════════════════
 
+    /// @dev `strategy` MUST be registered. Without that check `strategyBroken` on an
+    ///      unknown address reads false, so any address passes — and since the credit
+    ///      below is measured rather than returned, a keeper could otherwise point this
+    ///      at a contract that transfers nothing, inflate `idleBalance` by an arbitrary
+    ///      amount, and redeem against real assets at the inflated price. The keeper is
+    ///      an operational hot key and must not be able to reach user principal.
     function harvest(address strategy) external onlyKeeper nonReentrant returns (uint256 realized) {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        require(LibStrategyRegistry.isKnown(strategy), "UNKNOWN_STRATEGY");
         require(!s.strategyBroken[strategy], "STRATEGY_BROKEN");
-        realized = IStrategy(strategy).harvest();
-        if (realized != 0) s.idleBalance += realized;
+
+        bool ok;
+        (ok, realized) = LibStrategyRegistry.harvestInto(strategy);
+        require(ok, "HARVEST_FAILED");
+
         LibVaultNav.refreshNav();
         emit StrategyHarvested(strategy, realized);
     }
@@ -40,8 +50,12 @@ contract StrategyFacet is VaultModifiers {
     }
 
     /// @notice Permissionless NAV checkpoint refresh. No claim, no swap.
+    /// @dev    Deliberately UNANCHORED: a permissionless caller may refresh the
+    ///         checkpoint so views are current, but may not re-anchor the circuit
+    ///         breaker, trip it, or crystallize the performance fee. See
+    ///         `LibVaultNav.refreshNavUnanchored`.
     function settle() external nonReentrant {
-        uint256 totalAssets = LibVaultNav.refreshNav();
+        uint256 totalAssets = LibVaultNav.refreshNavUnanchored();
         emit Settled(totalAssets);
     }
 
@@ -134,11 +148,11 @@ contract StrategyFacet is VaultModifiers {
         for (uint256 i; i < n; i++) {
             address strat = strats[i];
             if (s.strategyBroken[strat]) continue;
-            try IStrategy(strat).harvest() returns (uint256 realized) {
-                if (realized != 0) s.idleBalance += realized;
+            (bool ok, uint256 realized) = LibStrategyRegistry.harvestInto(strat);
+            if (ok) {
                 emit StrategyHarvested(strat, realized);
-            } catch {
-                if (hardRevert) revert("HARVEST_FAILED");
+            } else if (hardRevert) {
+                revert("HARVEST_FAILED");
             }
         }
     }

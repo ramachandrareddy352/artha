@@ -51,6 +51,7 @@ library LibVaultNav {
     event StrategyReadReverted(address indexed strategy);
     event NavRefreshed(uint256 totalAssets);
     event Synced(uint256 creditedExtra, uint256 idleAfter);
+    event VaultAutoPaused(address indexed strategy);
 
     /// @notice Reconcile the idle ledger against the vault's real base balance,
     ///         crediting any un-tracked surplus (a direct donation) into idle.
@@ -68,7 +69,30 @@ library LibVaultNav {
 
     /// @notice Recompute and store `navCheckpoint`. Call this FIRST in every
     ///         state-changing vault entry point, before any share-math conversion.
+    ///         RE-ANCHORS the circuit breaker and crystallizes the performance fee.
     function refreshNav() internal returns (uint256 totalAssets) {
+        return _refreshNav(true);
+    }
+
+    /// @notice Recompute `navCheckpoint` from live reads WITHOUT re-anchoring the
+    ///         circuit breaker and WITHOUT crystallizing the performance fee.
+    ///
+    ///         This is the form a PERMISSIONLESS caller gets (`settle`). Letting an
+    ///         arbitrary caller re-anchor `strategyLastValue` would hand them the
+    ///         breaker's budget: they could walk a strategy's reported value up in
+    ///         sub-threshold steps, re-anchoring after each one, and never trip it.
+    ///         Here a suspicious reading is simply IGNORED (the anchored value is
+    ///         used instead) rather than trusted or used to trip the breaker — so a
+    ///         permissionless call can neither write a manipulated NAV nor grief the
+    ///         vault into a circuit break at a moment of its choosing.
+    function refreshNavUnanchored() internal returns (uint256 totalAssets) {
+        return _refreshNav(false);
+    }
+
+    /// @param anchor When true, accepted readings advance `strategyLastValue` /
+    ///        `strategyLastRefresh`, a suspicious reading trips the breaker, and the
+    ///        performance fee is crystallized. When false, none of that state moves.
+    function _refreshNav(bool anchor) private returns (uint256 totalAssets) {
         VaultStorage.Layout storage s = VaultStorage.vaultLayout();
 
         totalAssets = s.idleBalance;
@@ -84,19 +108,28 @@ library LibVaultNav {
 
             try IStrategy(strat).positionValue() returns (uint256 newValue) {
                 uint256 lastValue = s.strategyLastValue[strat];
+                uint256 elapsed = block.timestamp - s.strategyLastRefresh[strat];
 
-                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps)) {
-                    s.strategyBroken[strat] = true;
-                    emit StrategyCircuitBroken(strat, lastValue, newValue);
+                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps, elapsed)) {
+                    if (anchor) _breakCircuit(s, strat, lastValue, newValue);
                     totalAssets += lastValue;
                     continue;
                 }
 
-                s.strategyLastValue[strat] = newValue;
-                emit StrategyValueRefreshed(strat, newValue);
+                if (anchor) {
+                    s.strategyLastValue[strat] = newValue;
+                    s.strategyLastRefresh[strat] = block.timestamp;
+                    emit StrategyValueRefreshed(strat, newValue);
+                }
                 totalAssets += newValue;
             } catch {
                 emit StrategyReadReverted(strat);
+                // A read that reverts is a DEGRADED strategy, not a healthy one. Flag
+                // it so every downstream consumer treats it deterministically — most
+                // importantly `WithdrawFacet._drain`, which skips broken strategies
+                // and would otherwise walk into the same reverting venue and take the
+                // whole withdrawal down with it.
+                if (anchor) _breakCircuit(s, strat, s.strategyLastValue[strat], 0);
                 totalAssets += s.strategyLastValue[strat];
             }
         }
@@ -104,19 +137,54 @@ library LibVaultNav {
         s.navCheckpoint = totalAssets;
         emit NavRefreshed(totalAssets);
 
-        // Runs on EVERY refresh — see LibVaultFee for why price-per-share growth
-        // from pure interest accrual (no harvest event) must still be caught here.
-        LibVaultFee.chargePerformanceFee();
+        // Runs on EVERY anchored refresh — see LibVaultFee for why price-per-share
+        // growth from pure interest accrual (no harvest event) must still be caught.
+        if (anchor) LibVaultFee.chargePerformanceFee();
+    }
+
+    /// @dev Trip the breaker AND pause the vault.
+    ///
+    ///      The pause is the point. A degraded strategy keeps its last known-good
+    ///      value in NAV (so one bad venue can't freeze everything) but is skipped by
+    ///      `_drain` — which means, left running, redeemers would burn shares priced
+    ///      at a stale-high NAV and be paid out of the HEALTHY strategies. First
+    ///      movers would exit whole and the entire shortfall would land on whoever
+    ///      redeemed last. Pausing stops deposits and normal withdrawals for everyone
+    ///      at once, so the loss cannot be raced: the only remaining exit is
+    ///      `emergencyWithdraw`, which prices against a POST-unwind NAV and does
+    ///      attempt to unwind the suspect strategy.
+    function _breakCircuit(VaultStorage.Layout storage s, address strat, uint256 lastValue, uint256 attemptedValue)
+        private
+    {
+        s.strategyBroken[strat] = true;
+        emit StrategyCircuitBroken(strat, lastValue, attemptedValue);
+        if (!s.paused) {
+            s.paused = true;
+            emit VaultAutoPaused(strat);
+        }
     }
 
     /// @dev First-ever read of a strategy (lastValue == 0) is never flagged.
-    ///      Fail-SAFE on maxDeltaBps == 0: treat as "trip on any change" rather
-    ///      than a silent "breaker disabled" (governance input validation rejects
-    ///      0 anyway, so this should never be seen in practice).
-    function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps) private pure returns (bool) {
+    ///
+    ///      The allowance is `maxDeltaBps` earned linearly over DELTA_ALLOWANCE_WINDOW,
+    ///      so it bounds movement per unit TIME rather than per call — refreshing more
+    ///      often no longer grants more total headroom. A SAME-BLOCK re-read keeps the
+    ///      full allowance: harvest / divest / invest legitimately move a position and
+    ///      re-read it inside one transaction, and those must not trip the breaker.
+    ///
+    ///      Fail-SAFE on maxDeltaBps == 0: treat as "trip on any change" rather than a
+    ///      silent "breaker disabled" (governance input validation rejects 0 anyway).
+    function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps, uint256 elapsed)
+        private
+        pure
+        returns (bool)
+    {
         if (lastValue == 0) return false;
         uint256 diff = newValue > lastValue ? newValue - lastValue : lastValue - newValue;
         uint256 limit = (lastValue * maxDeltaBps) / BPS_DENOMINATOR;
+        if (elapsed != 0 && elapsed < DELTA_ALLOWANCE_WINDOW) {
+            limit = (limit * elapsed) / DELTA_ALLOWANCE_WINDOW;
+        }
         return diff > limit;
     }
 
