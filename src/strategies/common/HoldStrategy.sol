@@ -4,6 +4,7 @@ pragma solidity ^0.8.20;
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
+import {Math} from "openzeppelin-contracts/contracts/utils/math/Math.sol";
 
 import {BaseStrategy} from "../BaseStrategy.sol";
 
@@ -44,6 +45,8 @@ import {BaseStrategy} from "../BaseStrategy.sol";
 contract HoldStrategy is BaseStrategy {
     using SafeERC20 for IERC20;
 
+    uint256 internal constant BPS = 10_000;
+
     /// @notice The token this strategy buys and holds. Custodied by the VAULT.
     IERC20 public immutable held;
     uint8 public immutable heldDecimals;
@@ -79,15 +82,17 @@ contract HoldStrategy is BaseStrategy {
     }
 
     function _divest(uint256 amount) internal override {
-        // Sized so the EXPECTED proceeds are exactly `amount`, never grossed up for
-        // slippage. Everything this sells is forwarded to the vault, so overshooting
-        // would sell more of the held asset than the withdrawal needed and pay the
-        // spread on the excess — every single withdrawal. Coming up a few basis points
-        // short instead is explicitly allowed (`IStrategy.divest` returns what was
-        // actually delivered) and the vault's queue takes the remainder from the next
-        // strategy. Contrast `RotationStrategy`, which DOES gross up: it custodies its
-        // own base, so its overshoot stays in the position rather than being sold off.
-        uint256 needed = _baseToHeld(amount);
+        // GROSSED UP by the slippage tolerance, so the sale still clears `amount` after
+        // the spread. Sizing for exactly `amount` would come up a few basis points short
+        // on every single withdrawal — and `WithdrawFacet._drain` requires the FULL
+        // requested amount from the queue, so a shortfall is not a rounding annoyance,
+        // it reverts the user's withdrawal outright.
+        //
+        // The overshoot is not a loss: what the sale over-delivers arrives at the vault
+        // as idle and is redeployed by the next `deployIdle`. The only real cost is the
+        // spread on that small excess, which is the right price for a withdrawal that
+        // completes instead of reverting.
+        uint256 needed = Math.mulDiv(_baseToHeld(amount), BPS, BPS - maxSlippageBps);
         uint256 heldByVault = held.balanceOf(vault);
         if (needed > heldByVault) needed = heldByVault;
         if (needed == 0) return;
