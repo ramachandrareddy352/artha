@@ -199,8 +199,7 @@ contract CompoundV3Strategy is MultiRewardStrategy {
         if (!success || data.length < 96) return (false, address(0), 0, false, 0);
 
         if (data.length >= 128) {
-            (token, rescaleFactor, shouldUpscale, multiplier) =
-                abi.decode(data, (address, uint64, bool, uint256));
+            (token, rescaleFactor, shouldUpscale, multiplier) = abi.decode(data, (address, uint64, bool, uint256));
         } else {
             (token, rescaleFactor, shouldUpscale) = abi.decode(data, (address, uint64, bool));
             multiplier = FACTOR_SCALE;
