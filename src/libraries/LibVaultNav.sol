@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VaultStorage, BPS_DENOMINATOR, DELTA_ALLOWANCE_WINDOW} from "./VaultStorage.sol";
+import {VaultStorage, BPS_DENOMINATOR} from "./VaultStorage.sol";
 import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {LibVaultFee} from "./LibVaultFee.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
@@ -108,9 +108,8 @@ library LibVaultNav {
 
             try IStrategy(strat).positionValue() returns (uint256 newValue) {
                 uint256 lastValue = s.strategyLastValue[strat];
-                uint256 elapsed = block.timestamp - s.strategyLastRefresh[strat];
 
-                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps, elapsed)) {
+                if (_isSuspiciousJump(lastValue, newValue, s.strategyMaxDeltaBps)) {
                     if (anchor) _breakCircuit(s, strat, lastValue, newValue);
                     totalAssets += lastValue;
                     continue;
@@ -118,7 +117,6 @@ library LibVaultNav {
 
                 if (anchor) {
                     s.strategyLastValue[strat] = newValue;
-                    s.strategyLastRefresh[strat] = block.timestamp;
                     emit StrategyValueRefreshed(strat, newValue);
                 }
                 totalAssets += newValue;
@@ -158,33 +156,40 @@ library LibVaultNav {
     {
         s.strategyBroken[strat] = true;
         emit StrategyCircuitBroken(strat, lastValue, attemptedValue);
-        if (!s.paused) {
+        // Nothing is at stake in a strategy tracked at zero (freshly added, or already
+        // fully exited), so there is no mispriced value to race over. Flag it, but do
+        // not freeze the vault over a position that holds nothing.
+        if (lastValue != 0 && !s.paused) {
             s.paused = true;
             emit VaultAutoPaused(strat);
         }
     }
 
     /// @dev First-ever read of a strategy (lastValue == 0) is never flagged.
+    ///      Fail-SAFE on maxDeltaBps == 0: treat as "trip on any change" rather
+    ///      than a silent "breaker disabled" (governance input validation rejects
+    ///      0 anyway, so this should never be seen in practice).
     ///
-    ///      The allowance is `maxDeltaBps` earned linearly over DELTA_ALLOWANCE_WINDOW,
-    ///      so it bounds movement per unit TIME rather than per call — refreshing more
-    ///      often no longer grants more total headroom. A SAME-BLOCK re-read keeps the
-    ///      full allowance: harvest / divest / invest legitimately move a position and
-    ///      re-read it inside one transaction, and those must not trip the breaker.
+    ///  ═══════════════════════════════════════════════════════════════════════════
+    ///   KNOWN LIMIT: THIS BOUNDS MOVEMENT PER REFRESH, NOT PER UNIT TIME
+    ///  ═══════════════════════════════════════════════════════════════════════════
+    ///      An accepted reading RATCHETS `strategyLastValue`, so in principle a value
+    ///      can be walked past the threshold in sub-threshold steps by re-anchoring
+    ///      between each one. The free re-anchor is now closed — `settle`/`sync` use
+    ///      `refreshNavUnanchored` — so an attacker must pay for each step with a real
+    ///      deposit or withdrawal, or hold the keeper role.
     ///
-    ///      Fail-SAFE on maxDeltaBps == 0: treat as "trip on any change" rather than a
-    ///      silent "breaker disabled" (governance input validation rejects 0 anyway).
-    function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps, uint256 elapsed)
-        private
-        pure
-        returns (bool)
-    {
+    ///      Fully closing it needs an anchor that does not move with the attacker
+    ///      (time-rate budget, or drift measured against a keeper-confirmed value).
+    ///      A naive per-second budget is NOT safe here: harvest legitimately moves
+    ///      value out of a position, so a tight time-rate bound trips the breaker on a
+    ///      routine keeper harvest and — with the auto-pause below — would freeze the
+    ///      vault. Distinguishing yield from manipulation needs a harvest-aware model;
+    ///      that is a design decision, not a patch.
+    function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps) private pure returns (bool) {
         if (lastValue == 0) return false;
         uint256 diff = newValue > lastValue ? newValue - lastValue : lastValue - newValue;
         uint256 limit = (lastValue * maxDeltaBps) / BPS_DENOMINATOR;
-        if (elapsed != 0 && elapsed < DELTA_ALLOWANCE_WINDOW) {
-            limit = (limit * elapsed) / DELTA_ALLOWANCE_WINDOW;
-        }
         return diff > limit;
     }
 

@@ -36,13 +36,6 @@ uint16 constant MAX_PERFORMANCE_FEE_BPS = 3_000;
 // absurd toll. 0.1 ether.
 uint96 constant MAX_ENTRY_FEE_WEI = 0.1 ether;
 
-// Window over which a strategy accrues its FULL `strategyMaxDeltaBps` of movement
-// allowance in the NAV circuit breaker. A refresh sooner than this gets a
-// pro-rata slice of the allowance, so splitting one large move into many small
-// refreshes buys NO extra headroom — the breaker limits movement per unit TIME,
-// not per call, and the caller no longer controls the budget by choosing cadence.
-uint256 constant DELTA_ALLOWANCE_WINDOW = 1 hours;
-
 // How far a governance-confirmed circuit-breaker re-anchor may sit from the
 // strategy's own live reading. Bounds `clearStrategyCircuitBreak` so a fat-finger
 // can never mint NAV out of thin air. 500 = 5%.
@@ -88,7 +81,7 @@ library VaultStorage {
     ///      masked to a 256-aligned slot.
     bytes32 internal constant STORAGE_SLOT =
         keccak256(abi.encode(uint256(keccak256("artha.vault.storage")) - 1)) & ~bytes32(uint256(0xff));
- 
+
     struct Layout {
         address shareToken; // 20B — this vault's own share ERC-20 (mint/burn by this vault)
         uint8 baseDecimals; //  1B
@@ -98,63 +91,46 @@ library VaultStorage {
         uint16 harvestMaxImpactBps; //  2B
         bool paused; //  1B — read first by whenNotPaused, warms the whole slot
         bool initialized; //  1B — set once at init, prevents re-initialization
- 
-        /// @notice 1 = not entered, 2 = entered. 
+        /// @notice 1 = not entered, 2 = entered.
         uint256 reentrancyStatus;
-
         address baseAsset; // the base token (USDC, WETH, ...)
         address governance; // the ArthaTimelock — sole config/upgrade authority
         address treasury; // destination for the protocol's fee shares
-
         // ═══════════════════════ roles / exemptions (mappings) ═══════════════════
         mapping(address => bool) isKeeper;
         mapping(address => bool) isGuardian;
-        mapping(address => bool) isCapExempt;   // used for other protocols want to invest in our protocol
-
+        mapping(address => bool) isCapExempt; // used for other protocols want to invest in our protocol
         // ═══════════════════════ balances / NAV (hot writes, own slot) ═══════════
         uint256 idleBalance; // base held by this vault, un-deployed
         uint256 navCheckpoint; // last computed totalAssets
         uint256 highWaterMarkPps; // PPS_SCALE fixed point; ratchets up
-
         // ═══════════════════════ config limits (large, cold) ═════════════════════
         uint256 minDeposit; // base-token units; 0 = no floor
         uint256 tvlCap; // base-token units; 0 = uncapped
         uint256 depositCapPerBlock; // 0 = uncapped (bounded to uint192 in setters)
         uint256 withdrawCapPerBlock; // 0 = uncapped (bounded to uint192 in setters)
-
         // ═══════════════════════ per-block flow (packed pairs) ═══════════════════
         // block + cumulative amount are written together each capped op -> one slot.
         uint64 depositFlowBlock;
         uint192 depositFlowAmount;
         uint64 withdrawFlowBlock;
         uint192 withdrawFlowAmount;
-
         // ═══════════════════════ native-ETH entry fee (packed pair, 28B) ═════════
         // A flat ETH toll taken on every deposit/mint, pooled here as protocol-owned
         // ETH and withdrawable only by governance. Kept entirely separate from the
         // base-asset accounting above — user principal is never touched by it.
         uint96 entryFeeWei; // flat toll per invest; 0 = disabled (msg.value must be 0)
         uint128 collectedEthFees; // running total of tolls collected, admin-withdrawable
-
         // ═══════════════════════ strategies ══════════════════════════════════════
         address[] strategies; // priority order; withdrawal drains index 0 first
         mapping(address => uint16) strategyWeightBps;
         mapping(address => bool) strategyDisabled; // blocks new deploys only
         mapping(address => bool) strategyBroken; // circuit-broken
         mapping(address => uint256) strategyLastValue;
-
         // ═══════════════════════ router ══════════════════════════════════════════
         mapping(bytes4 => address) selectorToFacet;
-
         // ------- APPEND NEW STORAGE BELOW THIS LINE ONLY -------
-
-        /// @notice When each strategy's `strategyLastValue` was last ANCHORED (a
-        ///         keeper/user-driven refresh, a governance re-anchor, or an
-        ///         invest/divest). The circuit breaker scales its allowance by the
-        ///         time since this stamp — see DELTA_ALLOWANCE_WINDOW.
-        mapping(address => uint256) strategyLastRefresh;
-
-        uint256[49] __gap;
+        uint256[50] __gap;
     }
 
     function vaultLayout() internal pure returns (Layout storage s) {

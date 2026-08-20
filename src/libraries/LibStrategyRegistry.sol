@@ -49,6 +49,7 @@ library LibStrategyRegistry {
     event StrategyCircuitCleared(address indexed strategy, uint256 confirmedValue);
     event StrategyHarvestCredited(address indexed strategy, uint256 realized);
     event StrategyDivestFailed(address indexed strategy);
+    event StrategyTendFailed(address indexed strategy);
 
     // ─────────────────────────── capital movement ───────────────────────────────
 
@@ -80,6 +81,22 @@ library LibStrategyRegistry {
         }
     }
 
+    /// @notice Ask `strategy` to maintain its position — rotate its legs, re-park idle
+    ///         capital. Moves NO base between the vault and the strategy, so there is
+    ///         nothing to credit: the only visible effect is on the next NAV read.
+    /// @dev    Best-effort by design. Tending is optional upkeep, not settlement, and a
+    ///         strategy whose venue is momentarily unavailable must not be able to take
+    ///         a whole `tendAll` sweep down with it. A strategy with nothing to maintain
+    ///         no-ops, so this is safe to call across the entire set.
+    /// @return ok False if the tend reverted.
+    function tendInto(address strategy) internal returns (bool ok) {
+        try IStrategy(strategy).tend() {
+            ok = true;
+        } catch {
+            emit StrategyTendFailed(strategy);
+        }
+    }
+
     /// @notice Approve `amount` of base to `strategy` and invest it, crediting the
     ///         venue receipt to this vault. Accounts by the ACTUAL base spent
     ///         (balance-delta), so any un-deployed dust the strategy hands back
@@ -98,7 +115,6 @@ library LibStrategyRegistry {
 
         s.idleBalance -= spent;
         s.strategyLastValue[strategy] += spent;
-        s.strategyLastRefresh[strategy] = block.timestamp;
     }
 
     /// @notice Grant `strategy` transient receipt access, divest up to `amount`
@@ -170,7 +186,6 @@ library LibStrategyRegistry {
 
         if (freed != 0) s.idleBalance += freed;
         s.strategyLastValue[strategy] = 0;
-        s.strategyLastRefresh[strategy] = block.timestamp;
     }
 
     /// @dev Book a divest: idle up, tracked value down, breaker anchor re-stamped so
@@ -181,7 +196,6 @@ library LibStrategyRegistry {
         s.idleBalance += freed;
         uint256 last = s.strategyLastValue[strategy];
         s.strategyLastValue[strategy] = freed >= last ? 0 : last - freed;
-        s.strategyLastRefresh[strategy] = block.timestamp;
     }
 
     // ─────────────────────────── registry ───────────────────────────────────────
@@ -276,7 +290,6 @@ library LibStrategyRegistry {
         require(diff <= (live * CLEAR_ANCHOR_TOLERANCE_BPS) / BPS_DENOMINATOR, "ANCHOR_OUT_OF_BAND");
 
         s.strategyLastValue[strategy] = confirmedValue;
-        s.strategyLastRefresh[strategy] = block.timestamp;
         s.strategyBroken[strategy] = false;
         emit StrategyCircuitCleared(strategy, confirmedValue);
     }
@@ -314,7 +327,6 @@ library LibStrategyRegistry {
         delete s.strategyDisabled[strategy];
         delete s.strategyBroken[strategy];
         delete s.strategyLastValue[strategy];
-        delete s.strategyLastRefresh[strategy];
 
         emit StrategyRemoved(strategy, dust);
     }
@@ -348,7 +360,6 @@ library LibStrategyRegistry {
         delete s.strategyDisabled[from];
         delete s.strategyBroken[from];
         delete s.strategyLastValue[from];
-        delete s.strategyLastRefresh[from];
 
         list.push(to);
         s.strategyWeightBps[to] = weight;
