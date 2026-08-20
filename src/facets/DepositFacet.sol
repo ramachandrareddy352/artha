@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import {VaultStorage, VaultModifiers} from "../libraries/VaultStorage.sol";
 import {LibVaultMath} from "../libraries/LibVaultMath.sol";
 import {LibVaultNav} from "../libraries/LibVaultNav.sol";
-import {LibVaultCap} from "../libraries/LibVaultCap.sol"; 
+import {LibVaultCap} from "../libraries/LibVaultCap.sol";
 import {VaultShareToken} from "../VaultShareToken.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -26,8 +26,10 @@ import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/Safe
  */
 contract DepositFacet is VaultModifiers {
     using SafeERC20 for IERC20;
- 
-    event Deposited(address indexed payer, address indexed receiver, uint256 assets, uint256 shares, uint256 pricePerShare);
+
+    event Deposited(
+        address indexed payer, address indexed receiver, uint256 assets, uint256 shares, uint256 pricePerShare
+    );
     event EntryFeeCollected(address indexed payer, uint256 amount);
 
     function deposit(uint256 assets, address receiver, uint256 minSharesOut)
@@ -44,6 +46,10 @@ contract DepositFacet is VaultModifiers {
 
         _collectEntryFee(s);
         LibVaultNav.refreshNav();
+        // `whenNotPaused` ran before the body, but refreshNav can trip a strategy's
+        // circuit breaker and auto-pause mid-call. Re-check, so nobody is ever priced
+        // against a NAV the vault just declared untrustworthy.
+        require(!s.paused, "PAUSED");
 
         shares = LibVaultMath.convertToSharesDown(assets);
         require(shares != 0, "ZERO_SHARES");
@@ -71,6 +77,7 @@ contract DepositFacet is VaultModifiers {
 
         _collectEntryFee(s);
         LibVaultNav.refreshNav();
+        require(!s.paused, "PAUSED"); // see deposit(): refreshNav may auto-pause mid-call
 
         assets = LibVaultMath.convertToAssetsUp(shares);
         require(assets >= s.minDeposit, "BELOW_MIN_DEPOSIT");

@@ -7,7 +7,6 @@ import {LibVaultNav} from "../libraries/LibVaultNav.sol";
 import {LibVaultCap} from "../libraries/LibVaultCap.sol";
 import {LibStrategyRegistry} from "../libraries/LibStrategyRegistry.sol";
 import {VaultShareToken} from "../VaultShareToken.sol";
-import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -49,6 +48,10 @@ contract WithdrawFacet is VaultModifiers {
             _harvestAllActive(s);
         }
         LibVaultNav.refreshNav();
+        // `whenNotPaused` ran before the body, but refreshNav can trip a strategy's
+        // circuit breaker and auto-pause mid-call. Re-check — letting this one through
+        // is exactly the first-mover exit the auto-pause exists to prevent.
+        require(!s.paused, "PAUSED");
 
         shares = LibVaultMath.convertToSharesUp(assets);
         require(shares <= maxSharesBurned, "SLIPPAGE");
@@ -70,11 +73,13 @@ contract WithdrawFacet is VaultModifiers {
         require(shares != 0, "ZERO_SHARES");
 
         LibVaultNav.refreshNav();
+        require(!s.paused, "PAUSED"); // see withdraw(): refreshNav may auto-pause mid-call
         assets = LibVaultMath.convertToAssetsDown(shares);
 
         if (assets > s.idleBalance) {
             _harvestAllActive(s);
             LibVaultNav.refreshNav();
+            require(!s.paused, "PAUSED");
             assets = LibVaultMath.convertToAssetsDown(shares);
         }
 
@@ -137,7 +142,7 @@ contract WithdrawFacet is VaultModifiers {
             VaultShareToken(s.shareToken).spendAllowance(owner, msg.sender, shares);
         }
         VaultShareToken(s.shareToken).burn(owner, shares);
- 
+
         IERC20(s.baseAsset).safeTransfer(receiver, assets);
     }
 }

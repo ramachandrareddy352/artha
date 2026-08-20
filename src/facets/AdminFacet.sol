@@ -34,7 +34,7 @@ contract AdminFacet is VaultModifiers {
     event EthFeesWithdrawn(address indexed to, uint256 amount);
 
     // ═══════════════════════════ strategy lifecycle ══════════════════════════════
- 
+
     function addStrategy(
         address strategy,
         address[] calldata allStrategies,
@@ -64,11 +64,7 @@ contract AdminFacet is VaultModifiers {
     ///
     ///         Does NOT unpause. If the break auto-paused the vault, governance
     ///         unpauses separately via `EmergencyFacet.unpauseVault` once satisfied.
-    function clearStrategyCircuitBreak(address strategy, uint256 confirmedValue)
-        external
-        onlyGovernance
-        nonReentrant
-    {
+    function clearStrategyCircuitBreak(address strategy, uint256 confirmedValue) external onlyGovernance nonReentrant {
         LibStrategyRegistry.clearCircuitBreak(strategy, confirmedValue);
         LibVaultNav.refreshNav();
     }

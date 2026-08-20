@@ -28,7 +28,9 @@ contract EmergencyFacet is VaultModifiers {
 
     event VaultPaused(address indexed by);
     event VaultUnpaused(address indexed by);
-    event EmergencyWithdrawn(address indexed caller, address indexed receiver, address owner, uint256 shares, uint256 assetsReceived);
+    event EmergencyWithdrawn(
+        address indexed caller, address indexed receiver, address owner, uint256 shares, uint256 assetsReceived
+    );
 
     // ═══════════════════════════════ pause ════════════════════════════════════════
 
@@ -46,9 +48,12 @@ contract EmergencyFacet is VaultModifiers {
 
     /// @notice Fold any directly-transferred base ("extra") into idle, then refresh.
     ///         Permissionless — it can only ever add already-received value.
+    /// @dev    The refresh is UNANCHORED for the same reason as `StrategyFacet.settle`:
+    ///         a free, permissionless call must not be able to re-anchor the circuit
+    ///         breaker, trip it, or crystallize the performance fee.
     function sync() external nonReentrant returns (uint256 totalAssets) {
         LibVaultNav.sync();
-        totalAssets = LibVaultNav.refreshNav();
+        totalAssets = LibVaultNav.refreshNavUnanchored();
     }
 
     // ═══════════════════════════════ guaranteed exit ══════════════════════════════
@@ -155,7 +160,6 @@ contract EmergencyFacet is VaultModifiers {
         try IStrategy(strat).emergencyWithdraw() {
             uint256 freed = IERC20(s.baseAsset).balanceOf(address(this)) - beforeBal;
             s.strategyLastValue[strat] = 0;
-            s.strategyLastRefresh[strat] = block.timestamp;
             if (freed != 0) s.idleBalance += freed;
         } catch {}
         if (receipt != address(0)) IERC20(receipt).forceApprove(strat, 0);
