@@ -9,7 +9,7 @@ import {ERC20} from "openzeppelin-contracts/contracts/token/ERC20/ERC20.sol";
  *         each `Vault` in its constructor; mint/burn are restricted to that vault.
  *
  *  Decimals are fixed at 18 regardless of the base asset's own decimals
- * 
+ *
  *  `i_vault` is immutable and set once at deployment (the deploying Vault). Facet
  *  logic runs via `delegatecall` through the Vault, so any facet calling
  *  `mint`/`burn`/`spendAllowance` does so with `msg.sender == i_vault` regardless

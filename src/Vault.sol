@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import {VaultStorage, PPS_SCALE, DECIMALS_OFFSET, MAX_IDLE_BPS, MAX_PERFORMANCE_FEE_BPS, MAX_ENTRY_FEE_WEI, BPS_DENOMINATOR} from "./libraries/VaultStorage.sol";
+import {
+    VaultStorage,
+    PPS_SCALE,
+    DECIMALS_OFFSET,
+    MAX_IDLE_BPS,
+    MAX_PERFORMANCE_FEE_BPS,
+    MAX_ENTRY_FEE_WEI,
+    BPS_DENOMINATOR
+} from "./libraries/VaultStorage.sol";
 import {VaultShareToken} from "./VaultShareToken.sol";
 import {IERC20Metadata} from "openzeppelin-contracts/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
@@ -49,7 +57,7 @@ contract Vault {
         uint16 strategyMaxDeltaBps;
         uint16 harvestMaxImpactBps;
         uint96 entryFeeWei; // flat native-ETH toll per deposit/mint; 0 = disabled
-        uint256 minDeposit;   // in terms of base asset, not shares
+        uint256 minDeposit; // in terms of base asset, not shares
         uint256 tvlCap;
         uint256 depositCapPerBlock;
         uint256 withdrawCapPerBlock;
