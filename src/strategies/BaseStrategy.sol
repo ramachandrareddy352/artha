@@ -10,7 +10,7 @@ import {ReentrancyGuard} from "openzeppelin-contracts/contracts/utils/Reentrancy
 import {IStrategy} from "./interfaces/IStrategy.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
 import {ISwapper} from "./interfaces/ISwapper.sol";
- 
+
 /**
  * @title  BaseStrategy — stateless executor
  * @notice The shared skeleton every Artha strategy inherits. A strategy
@@ -32,7 +32,31 @@ import {ISwapper} from "./interfaces/ISwapper.sol";
  *                          strategy (the wrapper forwards to the vault).
  *   _positionValue()     : value of the VAULT's venue position, in base.
  *
- *  Optional: `_pendingRewardsValue`, `_harvestRewards`, `receiptToken`.
+ *  Optional: `_pendingRewardsValue`, `_harvestRewards`, `_tend`, `receiptToken`.
+ *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   THE ONE EXCEPTION: BASE-CUSTODYING STRATEGIES
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  A strategy whose POSITION can legitimately be plain base token sitting in the
+ *  strategy — a rotation/hold strategy parked on its base leg — overrides
+ *  `_custodiesBase()` to true. That single flag changes three things, because the
+ *  usual balance-DELTA settlement is meaningless when the strategy's resting
+ *  balance is itself the position:
+ *
+ *    invest  : the post-invest dust sweep is skipped (it would claw the whole
+ *              position back to the vault the moment the strategy holds base).
+ *    divest  : settles on `min(requested, balance)` rather than on the delta.
+ *    exit    : `emergencyWithdraw` sends the whole balance, not the delta.
+ *
+ *  `harvest` still settles on the delta in BOTH modes: reward proceeds are the only
+ *  thing that can raise the base balance during a harvest, so the delta measures
+ *  exactly what was realized without disturbing the resting position.
+ *
+ *  Such a strategy must NEVER let its position be base token held by the VAULT —
+ *  that is `idleBalance`, and counting it in `positionValue()` too would double-count
+ *  it into NAV. The same rule holds for every receipt: exactly one registered
+ *  strategy may report a given token balance as its position.
  *
  *  ═══════════════════════════════════════════════════════════════════════════
  *   VAULT-ONLY. RECEIPTS IN THE VAULT.
@@ -61,8 +85,10 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
     event Invested(uint256 assets);
     event Divested(uint256 assets);
     event Harvested(uint256 realized);
+    event Tended();
     event EmergencyWithdrawn(uint256 assets);
     event MaxSlippageSet(uint256 bps);
+    event Rescued(address indexed token, uint256 amount);
 
     modifier onlyVault() {
         require(msg.sender == vault, "NOT_VAULT");
@@ -102,6 +128,17 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
     /// @dev Unwind the vault's entire venue position to base INTO this strategy.
     function _withdrawAll() internal virtual;
 
+    /// @dev Position maintenance that neither takes base from nor returns base to the
+    ///      vault (a rotation between legs, a re-park). No-op default.
+    function _tend() internal virtual {}
+
+    /// @dev True when plain base token resting in THIS strategy is the position rather
+    ///      than un-deployed dust. See the header — it switches invest/divest/exit
+    ///      settlement from delta-based to balance-based.
+    function _custodiesBase() internal view virtual returns (bool) {
+        return false;
+    }
+
     /// @inheritdoc IStrategy
     function receiptToken() public view virtual override returns (address);
 
@@ -113,21 +150,36 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         _invest(assets);
         // Return any base the venue didn't consume (rounding/min-deposit dust) so it
         // stays as the vault's idle instead of stranding in this stateless executor.
-        uint256 dust = asset.balanceOf(address(this));
-        if (dust != 0) asset.safeTransfer(vault, dust);
+        // Skipped for a base-custodying strategy, where the resting balance IS the
+        // position and this sweep would undo the entire investment.
+        if (!_custodiesBase()) {
+            uint256 dust = asset.balanceOf(address(this));
+            if (dust != 0) asset.safeTransfer(vault, dust);
+        }
         emit Invested(assets);
     }
 
     function divest(uint256 assets) external override onlyVault nonReentrant returns (uint256 withdrawn) {
         require(assets != 0, "ZERO");
-        uint256 before = asset.balanceOf(address(this));
-        _divest(assets);
-        withdrawn = asset.balanceOf(address(this)) - before;
+        if (_custodiesBase()) {
+            _divest(assets);
+            // The strategy's resting base balance is part of the position, so a delta
+            // would read 0 whenever the position was ALREADY base. Settle on what is
+            // actually available instead, capped at what the vault asked for.
+            uint256 bal = asset.balanceOf(address(this));
+            withdrawn = assets < bal ? assets : bal;
+        } else {
+            uint256 before = asset.balanceOf(address(this));
+            _divest(assets);
+            withdrawn = asset.balanceOf(address(this)) - before;
+        }
         if (withdrawn != 0) asset.safeTransfer(vault, withdrawn);
         emit Divested(withdrawn);
     }
 
     function harvest() external override onlyVault nonReentrant returns (uint256 realized) {
+        // Delta in BOTH modes: only reward proceeds can move the base balance here, so
+        // the delta is exactly what was realized, resting position or not.
         uint256 before = asset.balanceOf(address(this));
         _harvestRewards();
         realized = asset.balanceOf(address(this)) - before;
@@ -135,18 +187,32 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         emit Harvested(realized);
     }
 
+    function tend() external override onlyVault nonReentrant {
+        _tend();
+        emit Tended();
+    }
+
     function emergencyWithdraw() external override onlyVault nonReentrant returns (uint256 withdrawn) {
-        uint256 before = asset.balanceOf(address(this));
-        _withdrawAll();
-        withdrawn = asset.balanceOf(address(this)) - before;
+        if (_custodiesBase()) {
+            _withdrawAll();
+            withdrawn = asset.balanceOf(address(this)); // everything, not the delta
+        } else {
+            uint256 before = asset.balanceOf(address(this));
+            _withdrawAll();
+            withdrawn = asset.balanceOf(address(this)) - before;
+        }
         if (withdrawn != 0) asset.safeTransfer(vault, withdrawn);
         emit EmergencyWithdrawn(withdrawn);
     }
 
     // ─────────────────────────────── views ──────────────────────────────────────
- 
+
     function positionValue() public view override returns (uint256) {
         return _positionValue() + _pendingRewardsValue();
+    }
+
+    function pendingRewardsValue() external view override returns (uint256) {
+        return _pendingRewardsValue();
     }
 
     function maxWithdraw() external view virtual override returns (uint256) {
@@ -159,6 +225,29 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         require(_bps <= MAX_SLIPPAGE_BPS, "SLIPPAGE_TOO_HIGH");
         maxSlippageBps = _bps;
         emit MaxSlippageSet(_bps);
+    }
+
+    /// @notice Sweep a token that is NOT part of this strategy's position back to the
+    ///         vault — an airdrop, a reward with no configured route, a leftover leg
+    ///         from a partially-failed swap.
+    /// @dev    The destination is hard-coded to the vault, so this is not an exfil
+    ///         path: the worst a compromised governance call achieves is moving a
+    ///         stray token to the custodian that already owns it. Position tokens are
+    ///         refused outright (`_isProtectedToken`), because sweeping one would
+    ///         silently move value out of `positionValue()` and into un-tracked idle.
+    function rescue(address token) external onlyVault nonReentrant returns (uint256 amount) {
+        require(!_isProtectedToken(token), "PROTECTED_TOKEN");
+        amount = IERC20(token).balanceOf(address(this));
+        if (amount != 0) IERC20(token).safeTransfer(vault, amount);
+        emit Rescued(token, amount);
+    }
+
+    /// @dev Tokens that make up this strategy's position and must never be swept.
+    ///      Base token counts only where the strategy custodies it as its position;
+    ///      elsewhere a stray base balance is dust the vault should get back.
+    function _isProtectedToken(address token) internal view virtual returns (bool) {
+        if (token == address(asset)) return _custodiesBase();
+        return token == receiptToken();
     }
 
     // ────────────────────────────── internal ────────────────────────────────────
@@ -175,9 +264,62 @@ abstract contract BaseStrategy is IStrategy, ReentrancyGuard {
         uint256 assetPrice = oracle.getPrice(address(asset)); // 8dp USD
         if (rewardPrice == 0 || assetPrice == 0) return 0;
 
-        uint256 gross = Math.mulDiv(
-            rewardAmount, rewardPrice * (10 ** assetDecimals), assetPrice * (10 ** rewardDecimals)
-        );
+        uint256 gross =
+            Math.mulDiv(rewardAmount, rewardPrice * (10 ** assetDecimals), assetPrice * (10 ** rewardDecimals));
         return (gross * (10_000 - REWARD_HAIRCUT_BPS)) / 10_000;
+    }
+
+    /// @dev Convert `amount` of `from` into `to` units at ORACLE prices (no haircut).
+    ///      The one conversion every cross-asset strategy uses — for valuation, and to
+    ///      derive the `minOut` floor of the swap that realizes it. Reverts rather than
+    ///      returning 0 when either price is missing: a silent 0 here would become a
+    ///      `minOut` of 0, which is an unbounded-slippage swap.
+    function _convert(address from, uint8 fromDecimals, uint256 amount, address to, uint8 toDecimals)
+        internal
+        view
+        returns (uint256)
+    {
+        if (amount == 0) return 0;
+        if (from == to) return amount;
+        uint256 pFrom = oracle.getPrice(from); // 8dp USD
+        uint256 pTo = oracle.getPrice(to); // 8dp USD
+        require(pFrom != 0 && pTo != 0, "NO_PRICE");
+        return Math.mulDiv(amount, pFrom * (10 ** toDecimals), pTo * (10 ** fromDecimals));
+    }
+
+    /// @dev `_convert` with the oracle reads made non-fatal, for the paths that must
+    ///      degrade instead of revert — chiefly anything reachable from the vault's NAV
+    ///      loop, where a revert trips this strategy's circuit breaker and pauses the
+    ///      whole vault. Callers that use the result as a swap floor MUST refuse to
+    ///      swap when `ok` is false rather than treating 0 as "no minimum".
+    function _tryConvert(address from, uint8 fromDecimals, uint256 amount, address to, uint8 toDecimals)
+        internal
+        view
+        returns (bool ok, uint256 value)
+    {
+        if (amount == 0) return (true, 0);
+        if (from == to) return (true, amount);
+
+        uint256 pFrom;
+        uint256 pTo;
+        try oracle.getPrice(from) returns (uint256 p) {
+            pFrom = p;
+        } catch {
+            return (false, 0);
+        }
+        try oracle.getPrice(to) returns (uint256 p) {
+            pTo = p;
+        } catch {
+            return (false, 0);
+        }
+        if (pFrom == 0 || pTo == 0) return (false, 0);
+
+        return (true, Math.mulDiv(amount, pFrom * (10 ** toDecimals), pTo * (10 ** fromDecimals)));
+    }
+
+    /// @dev `expected` less the strategy's slippage tolerance — the floor handed to
+    ///      every swapper call. Never derived from the venue's own quote.
+    function _floor(uint256 expected) internal view returns (uint256) {
+        return (expected * (10_000 - maxSlippageBps)) / 10_000;
     }
 }

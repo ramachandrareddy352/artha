@@ -16,12 +16,7 @@ import {CrossAssetERC4626Strategy} from "../../common/CrossAssetERC4626Strategy.
  *           in a higher-risk tier than plain lending; size accordingly.
  */
 contract EthenaSUsdeStrategy is CrossAssetERC4626Strategy {
-    constructor(
-        address _vault,
-        address _usdc,
-        address _oracle,
-        address _swapper,
-        address _sUsde,
-        address _usde
-    ) CrossAssetERC4626Strategy(_vault, _usdc, _oracle, _swapper, _sUsde, _usde) {}
+    constructor(address _vault, address _usdc, address _oracle, address _swapper, address _sUsde, address _usde)
+        CrossAssetERC4626Strategy(_vault, _usdc, _oracle, _swapper, _sUsde, _usde)
+    {}
 }

@@ -15,12 +15,7 @@ import {CrossAssetERC4626Strategy} from "../../common/CrossAssetERC4626Strategy.
  *   risk  : USDS peg + the swap round-trip. Low.
  */
 contract SkySUsdsStrategy is CrossAssetERC4626Strategy {
-    constructor(
-        address _vault,
-        address _usdc,
-        address _oracle,
-        address _swapper,
-        address _sUsds,
-        address _usds
-    ) CrossAssetERC4626Strategy(_vault, _usdc, _oracle, _swapper, _sUsds, _usds) {}
+    constructor(address _vault, address _usdc, address _oracle, address _swapper, address _sUsds, address _usds)
+        CrossAssetERC4626Strategy(_vault, _usdc, _oracle, _swapper, _sUsds, _usds)
+    {}
 }

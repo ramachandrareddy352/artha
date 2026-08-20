@@ -26,11 +26,25 @@ interface ISwapRouterV3 {
  *   data = the encoded V3 path bytes:
  *          abi.encodePacked(tokenIn, fee0, mid, fee1, tokenOut)   (multi-hop)
  *          or abi.encodePacked(tokenIn, fee, tokenOut)            (single-hop)
- *   The path's first token MUST be tokenIn and last MUST be tokenOut.
  *   `minOut` is the strategy's oracle floor, passed straight to amountOutMinimum.
+ *
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *   THE PATH IS CHECKED AGAINST THE REQUESTED PAIR
+ *  ═══════════════════════════════════════════════════════════════════════════
+ *
+ *  A V3 path is opaque packed bytes, and the router happily honours one that ends in a
+ *  token nobody asked for — `amountOutMinimum` would then be enforced against THAT
+ *  token, so a mis-set route could satisfy the router while delivering the caller
+ *  nothing it can use. So the first and last 20 bytes of the path are decoded and
+ *  required to equal `tokenIn`/`tokenOut`, and the output is measured as the caller's
+ *  own balance delta rather than taken from the router's return value.
  */
 contract UniswapV3Swapper is ISwapper {
     using SafeERC20 for IERC20;
+
+    /// @dev A path is 20-byte tokens separated by 3-byte fees: 20 + n*(3 + 20).
+    uint256 private constant ADDR_SIZE = 20;
+    uint256 private constant FEE_SIZE = 3;
 
     ISwapRouterV3 public immutable router;
 
@@ -44,10 +58,16 @@ contract UniswapV3Swapper is ISwapper {
         override
         returns (uint256 amountOut)
     {
+        require(data.length >= ADDR_SIZE + FEE_SIZE + ADDR_SIZE, "PATH_TOO_SHORT");
+        require((data.length - ADDR_SIZE) % (FEE_SIZE + ADDR_SIZE) == 0, "BAD_PATH_SHAPE");
+        require(_tokenAt(data, 0) == tokenIn, "PATH_IN_MISMATCH");
+        require(_tokenAt(data, data.length - ADDR_SIZE) == tokenOut, "PATH_OUT_MISMATCH");
+
         IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
         IERC20(tokenIn).forceApprove(address(router), amountIn);
 
-        amountOut = router.exactInput(
+        uint256 balBefore = IERC20(tokenOut).balanceOf(msg.sender);
+        router.exactInput(
             ISwapRouterV3.ExactInputParams({
                 path: data,
                 recipient: msg.sender, // deliver straight back to the strategy
@@ -55,8 +75,16 @@ contract UniswapV3Swapper is ISwapper {
                 amountOutMinimum: minOut
             })
         );
+        amountOut = IERC20(tokenOut).balanceOf(msg.sender) - balBefore;
 
         require(amountOut >= minOut, "MIN_OUT");
         IERC20(tokenIn).forceApprove(address(router), 0);
+    }
+
+    /// @dev The 20-byte address starting at `offset` of a packed V3 path.
+    function _tokenAt(bytes calldata path, uint256 offset) private pure returns (address token) {
+        assembly {
+            token := shr(96, calldataload(add(path.offset, offset)))
+        }
     }
 }

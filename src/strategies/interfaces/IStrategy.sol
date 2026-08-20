@@ -40,6 +40,13 @@ interface IStrategy {
     /// @notice How much base could be divested right now, bounded by venue liquidity.
     function maxWithdraw() external view returns (uint256);
 
+    /// @notice The (haircut) base value of rewards accrued at the venue but NOT yet
+    ///         claimed. Already included in `positionValue()`; exposed separately so a
+    ///         keeper can decide whether a harvest is worth its gas. Venues whose
+    ///         pending rewards cannot be read in a view report 0 — under-reporting is
+    ///         always safe, over-reporting is not.
+    function pendingRewardsValue() external view returns (uint256);
+
     /// @notice Pull `assets` of base (pre-approved by the vault) and deploy it,
     ///         crediting the venue receipt to the vault. Vault-only.
     function invest(uint256 assets) external;
@@ -52,6 +59,17 @@ interface IStrategy {
     /// @notice Claim rewards, swap to base, send base to the vault. Returns the
     ///         base realized. Vault-only.
     function harvest() external returns (uint256 harvested);
+
+    /// @notice Position MAINTENANCE — adjust what the position is made of without
+    ///         moving base in or out of the vault. This is where a rotation strategy
+    ///         swaps between its two legs, and where any strategy re-parks capital.
+    ///         A no-op for strategies with nothing to maintain. Vault-only.
+    ///
+    ///         Split from `harvest()` deliberately: harvest REALIZES value back to the
+    ///         vault and is priced by the base delta it delivers, while tend changes
+    ///         nothing about how much the vault holds — only where it sits. Merging
+    ///         them would make a rotation's slippage look like negative harvest.
+    function tend() external;
 
     /// @notice Unwind the entire position to base and send it to the vault,
     ///         skipping reward accounting. The escape hatch. Vault-only.
