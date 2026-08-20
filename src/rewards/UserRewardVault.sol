@@ -83,10 +83,10 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
 
     /// @notice Config + lifetime books for one registered vault.
     struct VaultInfo {
-        bool registered;          // if set false again, the vault is ignored
-        address shareToken;       // the vault's share token, custodied here when staked
+        bool registered; // if set false again, the vault is ignored
+        address shareToken; // the vault's share token, custodied here when staked
         uint256 totalArthaEarned; // lifetime ARTHA accrued to this vault's stakers
-        uint256 totalArthaClaimed;// lifetime ARTHA claimed out of this vault
+        uint256 totalArthaClaimed; // lifetime ARTHA claimed out of this vault
     }
 
     // ─────────────────────────────── events ─────────────────────────────────────
