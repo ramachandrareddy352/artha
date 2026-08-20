@@ -11,6 +11,7 @@ import {
 } from "../libraries/VaultStorage.sol";
 import {LibStrategyRegistry} from "../libraries/LibStrategyRegistry.sol";
 import {LibVaultNav} from "../libraries/LibVaultNav.sol";
+import {IStrategy} from "../strategies/interfaces/IStrategy.sol";
 
 /**
  * @title  AdminFacet
@@ -30,6 +31,7 @@ contract AdminFacet is VaultModifiers {
     event TreasurySet(address oldTreasury, address newTreasury);
     event GovernanceTransferred(address oldGovernance, address newGovernance);
     event IdleTargetSet(uint16 bps);
+    event StrategyConfigured(address indexed strategy, bytes4 selector);
     event EntryFeeSet(uint96 oldWei, uint96 newWei);
     event EthFeesWithdrawn(address indexed to, uint256 amount);
 
@@ -77,6 +79,52 @@ contract AdminFacet is VaultModifiers {
     function migrateStrategy(address from, address to) external onlyGovernance nonReentrant {
         LibStrategyRegistry.migrateStrategy(from, to);
         LibVaultNav.refreshNav();
+    }
+
+    /// @notice Call a CONFIGURATION function on one of this vault's strategies.
+    ///
+    ///         Every strategy setter — swap routes, reward registrations, rotation
+    ///         bands, slippage tolerance, stray-token rescue — is `onlyVault`, because
+    ///         the vault is the only party a strategy trusts. Without this forwarder
+    ///         there is no way to reach any of them, and a strategy needing a route
+    ///         (every rotation and cross-asset strategy does) would be permanently
+    ///         unconfigurable.
+    ///
+    /// @dev    Two bounds make this narrow rather than an arbitrary-call surface:
+    ///
+    ///         1. `strategy` MUST be registered with this vault, so the call can only
+    ///            ever land on code governance already adopted.
+    ///         2. The `IStrategy` money-movers are BLOCKED by selector. Those are the
+    ///            vault's own accounting operations: calling `divest` from here would
+    ///            move base without `LibStrategyRegistry` crediting `idleBalance` or
+    ///            decrementing the tracked value, leaving NAV wrong until the next
+    ///            `sync`. Capital moves through `deployIdle`/`rebalance`/the withdrawal
+    ///            queue, never through here.
+    function execOnStrategy(address strategy, bytes calldata data)
+        external
+        onlyGovernance
+        nonReentrant
+        returns (bytes memory result)
+    {
+        require(LibStrategyRegistry.isKnown(strategy), "UNKNOWN_STRATEGY");
+        require(data.length >= 4, "BAD_CALLDATA");
+
+        bytes4 selector = bytes4(data[:4]);
+        require(
+            selector != IStrategy.invest.selector && selector != IStrategy.divest.selector
+                && selector != IStrategy.harvest.selector && selector != IStrategy.tend.selector
+                && selector != IStrategy.emergencyWithdraw.selector,
+            "USE_VAULT_FLOW"
+        );
+
+        bool ok;
+        (ok, result) = strategy.call(data);
+        if (!ok) {
+            assembly {
+                revert(add(result, 32), mload(result))
+            }
+        }
+        emit StrategyConfigured(strategy, selector);
     }
 
     // ═══════════════════════════ risk limits ══════════════════════════════════════

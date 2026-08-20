@@ -23,6 +23,13 @@ interface ISwapRouterV3 {
  *         volatile reward tokens (CRV, CVX, COMP, BAL, ...) where a multi-hop path
  *         through WETH gives the deepest liquidity.
  *
+ *  ⚠ ROUTER SHAPE: this targets **SwapRouter02** (mainnet
+ *  0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45), whose `ExactInputParams` is
+ *  {path, recipient, amountIn, amountOutMinimum}. The ORIGINAL SwapRouter
+ *  (0xE592427A...) takes an extra `deadline` between recipient and amountIn, so
+ *  pointing this at it makes every swap revert with no reason string as the router
+ *  fails to decode the calldata. Check the fork's router before deploying.
+ *
  *   data = the encoded V3 path bytes:
  *          abi.encodePacked(tokenIn, fee0, mid, fee1, tokenOut)   (multi-hop)
  *          or abi.encodePacked(tokenIn, fee, tokenOut)            (single-hop)

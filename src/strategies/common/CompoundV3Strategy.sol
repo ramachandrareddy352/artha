@@ -156,22 +156,56 @@ contract CompoundV3Strategy is MultiRewardStrategy {
     }
 
     function _pendingRewardAmount(address token) internal view override returns (uint256) {
-        ICometRewards.RewardConfig memory config;
-        try cometRewards.rewardConfig(address(comet)) returns (ICometRewards.RewardConfig memory c) {
-            config = c;
-        } catch {
-            return 0; // older layout without `multiplier` — under-report, never revert
-        }
-        if (config.token != token || config.rescaleFactor == 0) return 0;
+        (bool ok, address rewardToken, uint64 rescaleFactor, bool shouldUpscale, uint256 multiplier) = _rewardConfig();
+        if (!ok || rewardToken != token || rescaleFactor == 0) return 0;
 
         uint256 accrued = comet.baseTrackingAccrued(address(this));
         if (accrued == 0) return 0;
 
-        accrued = config.shouldUpscale ? accrued * config.rescaleFactor : accrued / config.rescaleFactor;
-        if (config.multiplier != 0) accrued = Math.mulDiv(accrued, config.multiplier, FACTOR_SCALE);
+        accrued = shouldUpscale ? accrued * rescaleFactor : accrued / rescaleFactor;
+        if (multiplier != FACTOR_SCALE) accrued = Math.mulDiv(accrued, multiplier, FACTOR_SCALE);
 
-        uint256 claimed = cometRewards.rewardsClaimed(address(comet), address(this));
+        uint256 claimed;
+        try cometRewards.rewardsClaimed(address(comet), address(this)) returns (uint256 c) {
+            claimed = c;
+        } catch {
+            return 0;
+        }
         return accrued > claimed ? accrued - claimed : 0;
+    }
+
+    /// @dev Read `rewardConfig` WITHOUT letting the ABI decoder abort valuation.
+    ///
+    ///      CometRewards ships in two shapes in production: the original three-field
+    ///      `{token, rescaleFactor, shouldUpscale}` and a newer four-field version that
+    ///      appends `multiplier`. Decoding the short one into the long struct fails —
+    ///      and a return-data DECODING failure is NOT caught by `try/catch`, it reverts
+    ///      straight through the caller. That would take `positionValue()` down with it,
+    ///      which the vault's NAV loop reads as a broken strategy: circuit breaker
+    ///      tripped, whole vault auto-paused, by nothing worse than a venue we read
+    ///      one word too eagerly.
+    ///
+    ///      So the call is made raw and the return data is decoded by LENGTH, with a
+    ///      missing `multiplier` defaulting to `FACTOR_SCALE` (i.e. no scaling), which
+    ///      is exactly what the three-field version means.
+    function _rewardConfig()
+        internal
+        view
+        returns (bool ok, address token, uint64 rescaleFactor, bool shouldUpscale, uint256 multiplier)
+    {
+        (bool success, bytes memory data) = address(cometRewards).staticcall(
+            abi.encodeWithSelector(ICometRewards.rewardConfig.selector, address(comet))
+        );
+        if (!success || data.length < 96) return (false, address(0), 0, false, 0);
+
+        if (data.length >= 128) {
+            (token, rescaleFactor, shouldUpscale, multiplier) =
+                abi.decode(data, (address, uint64, bool, uint256));
+        } else {
+            (token, rescaleFactor, shouldUpscale) = abi.decode(data, (address, uint64, bool));
+            multiplier = FACTOR_SCALE;
+        }
+        ok = true;
     }
 
     // ───────────────────────────────── views ────────────────────────────────────

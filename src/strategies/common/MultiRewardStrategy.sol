@@ -85,6 +85,7 @@ abstract contract MultiRewardStrategy is BaseStrategy {
     event RewardMinHarvestSet(address indexed token, uint128 minHarvest);
     event RewardSold(address indexed token, uint256 amountIn, uint256 baseOut);
     event RewardSkipped(address indexed token, uint256 amount, string reason);
+    event ClaimFailed();
 
     constructor(address _vault, address _asset, address _oracle, address _swapper, address[] memory _rewardTokens)
         BaseStrategy(_vault, _asset, _oracle, _swapper)
@@ -98,6 +99,15 @@ abstract contract MultiRewardStrategy is BaseStrategy {
 
     /// @dev Claim the venue's rewards INTO this strategy. Selling is not your job.
     function _claimRewards() internal virtual {}
+
+    /// @notice The claim step, exposed so `_harvestRewards` can `try` it — an internal
+    ///         call cannot be caught, and this must never take a harvest down. Self-call
+    ///         only; deliberately NOT `nonReentrant`, since `harvest()` already holds
+    ///         that lock when it reaches here.
+    function claimRewards() external {
+        require(msg.sender == address(this), "ONLY_SELF");
+        _claimRewards();
+    }
 
     /// @dev Accrued-but-unclaimed `token`, in token units. Return 0 when the venue
     ///      exposes no view for it — under-reporting is safe, over-reporting is not.
@@ -128,8 +138,29 @@ abstract contract MultiRewardStrategy is BaseStrategy {
     }
 
     /// @inheritdoc BaseStrategy
+    /// @dev The CLAIM is best-effort, for the same reason the sell is.
+    ///
+    ///      A venue can fail to pay emissions it has already promised — most commonly
+    ///      because its distributor contract has simply RUN OUT of the reward token
+    ///      (Compound's `CometRewards` is in exactly that state on mainnet today, and
+    ///      reverts `claim` with "transfer amount exceeds balance"). If that revert
+    ///      propagated, one under-funded third-party contract would take down far more
+    ///      than the reward it failed to pay:
+    ///
+    ///        - `StrategyFacet.rebalance` harvests with hardRevert -> NO rebalance,
+    ///          ever, for the whole vault;
+    ///        - `removeStrategy` / `migrateStrategy` require the harvest to succeed ->
+    ///          governance could not even RETIRE the affected strategy;
+    ///        - `StrategyFacet.harvest` reverts outright.
+    ///
+    ///      So a failed claim is recorded and stepped over: the emission stays
+    ///      unclaimed at the venue, every other reward in the set still sells, and the
+    ///      whole thing is retried on the next harvest.
     function _harvestRewards() internal virtual override {
-        _claimRewards();
+        try this.claimRewards() {}
+        catch {
+            emit ClaimFailed();
+        }
 
         uint256 n = rewardTokens.length;
         for (uint256 i; i < n; ++i) {

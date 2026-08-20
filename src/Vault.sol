@@ -141,6 +141,8 @@ contract Vault {
         // StrategyFacet
         s.selectorToFacet[StrategyFacet.harvest.selector] = f.strategy;
         s.selectorToFacet[StrategyFacet.harvestAll.selector] = f.strategy;
+        s.selectorToFacet[StrategyFacet.tend.selector] = f.strategy;
+        s.selectorToFacet[StrategyFacet.tendAll.selector] = f.strategy;
         s.selectorToFacet[StrategyFacet.settle.selector] = f.strategy;
         s.selectorToFacet[StrategyFacet.deployIdle.selector] = f.strategy;
         s.selectorToFacet[StrategyFacet.rebalance.selector] = f.strategy;
@@ -152,6 +154,7 @@ contract Vault {
         s.selectorToFacet[AdminFacet.clearStrategyCircuitBreak.selector] = f.admin;
         s.selectorToFacet[AdminFacet.removeStrategy.selector] = f.admin;
         s.selectorToFacet[AdminFacet.migrateStrategy.selector] = f.admin;
+        s.selectorToFacet[AdminFacet.execOnStrategy.selector] = f.admin;
         s.selectorToFacet[AdminFacet.setCaps.selector] = f.admin;
         s.selectorToFacet[AdminFacet.setCapExempt.selector] = f.admin;
         s.selectorToFacet[AdminFacet.setIdleTargetBps.selector] = f.admin;
