@@ -87,10 +87,7 @@ contract ArthaTimelock is TimelockController {
      *                   renounce after roles are granted. The timelock
      *                   always also self-holds DEFAULT_ADMIN_ROLE.
      */
-    constructor(
-        uint256 minDelay,
-        address[] memory proposers,
-        address[] memory executors,
-        address admin
-    ) TimelockController(minDelay, proposers, executors, admin) {}
+    constructor(uint256 minDelay, address[] memory proposers, address[] memory executors, address admin)
+        TimelockController(minDelay, proposers, executors, admin)
+    {}
 }

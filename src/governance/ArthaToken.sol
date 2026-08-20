@@ -52,11 +52,9 @@ import {AccessControl} from "openzeppelin-contracts/contracts/access/AccessContr
  *  so that adding/removing minters is itself a governance action.
  */
 contract ArthaToken is ERC20, ERC20Permit, ERC20Votes, AccessControl {
-
     /// @notice Role allowed to mint new ARTHA (emissions controller).
     ///         keccak256("MINTER_ROLE")
     bytes32 public constant MINTER_ROLE = keccak256("MINTER_ROLE");
-
 
     /// @notice Hard cap on total supply. Immutable — cannot be raised even
     ///         by governance. Example: 1_000_000_000e18 (1B ARTHA).
@@ -112,20 +110,12 @@ contract ArthaToken is ERC20, ERC20Permit, ERC20Votes, AccessControl {
 
     /// @dev ERC20Votes hooks _update to write a checkpoint on every
     ///      balance change (transfer / mint / burn).
-    function _update(address from, address to, uint256 value)
-        internal
-        override(ERC20, ERC20Votes)
-    {
+    function _update(address from, address to, uint256 value) internal override(ERC20, ERC20Votes) {
         super._update(from, to, value);
     }
 
     /// @dev Both ERC20Permit and Votes (via Nonces) track nonces.
-    function nonces(address owner)
-        public
-        view
-        override(ERC20Permit, Nonces)
-        returns (uint256)
-    {
+    function nonces(address owner) public view override(ERC20Permit, Nonces) returns (uint256) {
         return super.nonces(owner);
     }
 }

@@ -5,8 +5,10 @@ import {Governor} from "openzeppelin-contracts/contracts/governance/Governor.sol
 import {GovernorSettings} from "openzeppelin-contracts/contracts/governance/extensions/GovernorSettings.sol";
 import {GovernorCountingSimple} from "openzeppelin-contracts/contracts/governance/extensions/GovernorCountingSimple.sol";
 import {GovernorVotes} from "openzeppelin-contracts/contracts/governance/extensions/GovernorVotes.sol";
-import {GovernorVotesQuorumFraction} from "openzeppelin-contracts/contracts/governance/extensions/GovernorVotesQuorumFraction.sol";
-import {GovernorTimelockControl} from "openzeppelin-contracts/contracts/governance/extensions/GovernorTimelockControl.sol";
+import {GovernorVotesQuorumFraction} from
+    "openzeppelin-contracts/contracts/governance/extensions/GovernorVotesQuorumFraction.sol";
+import {GovernorTimelockControl} from
+    "openzeppelin-contracts/contracts/governance/extensions/GovernorTimelockControl.sol";
 import {IVotes} from "openzeppelin-contracts/contracts/governance/utils/IVotes.sol";
 import {TimelockController} from "openzeppelin-contracts/contracts/governance/TimelockController.sol";
 
@@ -155,31 +157,16 @@ contract ArthaGovernor is
     //////////////////////////////////////////////////////////////*/
 
     /// @dev GovernorSettings stores the value; Governor declares the API.
-    function votingDelay()
-        public
-        view
-        override(Governor, GovernorSettings)
-        returns (uint256)
-    {
+    function votingDelay() public view override(Governor, GovernorSettings) returns (uint256) {
         return super.votingDelay();
     }
 
-    function votingPeriod()
-        public
-        view
-        override(Governor, GovernorSettings)
-        returns (uint256)
-    {
+    function votingPeriod() public view override(Governor, GovernorSettings) returns (uint256) {
         return super.votingPeriod();
     }
 
     /// @dev quorum(timepoint) = pastTotalSupply(timepoint) * numerator / 100.
-    function quorum(uint256 timepoint)
-        public
-        view
-        override(Governor, GovernorVotesQuorumFraction)
-        returns (uint256)
-    {
+    function quorum(uint256 timepoint) public view override(Governor, GovernorVotesQuorumFraction) returns (uint256) {
         return super.quorum(timepoint);
     }
 
@@ -205,12 +192,7 @@ contract ArthaGovernor is
         return super.proposalNeedsQueuing(proposalId);
     }
 
-    function proposalThreshold()
-        public
-        view
-        override(Governor, GovernorSettings)
-        returns (uint256)
-    {
+    function proposalThreshold() public view override(Governor, GovernorSettings) returns (uint256) {
         return super.proposalThreshold();
     }
 
@@ -251,12 +233,7 @@ contract ArthaGovernor is
     /// @dev The address that ultimately performs calls = the TIMELOCK.
     ///      This is exactly why protocol contracts must set the timelock
     ///      (never the governor) as their admin/owner.
-    function _executor()
-        internal
-        view
-        override(Governor, GovernorTimelockControl)
-        returns (address)
-    {
+    function _executor() internal view override(Governor, GovernorTimelockControl) returns (address) {
         return super._executor();
     }
 }
