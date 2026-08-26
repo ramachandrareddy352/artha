@@ -187,7 +187,33 @@ library LibVaultNav {
     ///      vault. Distinguishing yield from manipulation needs a harvest-aware model;
     ///      that is a design decision, not a patch.
     function _isSuspiciousJump(uint256 lastValue, uint256 newValue, uint16 maxDeltaBps) private pure returns (bool) {
-        if (lastValue == 0) return false;
+        // ═══════════════════════════════════════════════════════════════════════
+        //  ABSOLUTE CEILING — this one is a liveness guard, not a valuation guard
+        // ═══════════════════════════════════════════════════════════════════════
+        //  `_refreshNav` sums these readings into `totalAssets`. A reading near
+        //  `type(uint256).max` overflows that checked addition, which reverts
+        //  refreshNav — and refreshNav is called by EVERY state-changing entry point,
+        //  including `removeStrategy`. A single absurd reading would therefore brick
+        //  the vault permanently, with no path to remove the strategy that caused it.
+        //  No real position is worth more than 2^128 of any token, so anything above
+        //  that is a broken venue, never a valuation.
+        if (newValue > type(uint128).max) return true;
+
+        // ═══════════════════════════════════════════════════════════════════════
+        //  A STRATEGY THAT WAS NEVER FUNDED CANNOT BE WORTH ANYTHING
+        // ═══════════════════════════════════════════════════════════════════════
+        //  `lastValue` is stamped by `investInto` the moment capital is deployed, so
+        //  `lastValue == 0` means this strategy has never received a single unit from
+        //  the vault. A positive reading from it is therefore unexplained by anything
+        //  the vault did, and must not be trusted: without this, a freshly registered
+        //  strategy's FIRST reading is accepted unconditionally and can write any
+        //  number it likes straight into NAV.
+        //
+        //  A direct donation of receipt tokens is the one benign case this flags. That
+        //  is the correct trade: it freezes at zero rather than trusting the number,
+        //  and governance can adopt the real figure through `clearStrategyCircuitBreak`.
+        if (lastValue == 0) return newValue != 0;
+
         uint256 diff = newValue > lastValue ? newValue - lastValue : lastValue - newValue;
         uint256 limit = (lastValue * maxDeltaBps) / BPS_DENOMINATOR;
         return diff > limit;
