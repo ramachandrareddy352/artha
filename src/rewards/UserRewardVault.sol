@@ -161,7 +161,7 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
             if (capped) emit ArthaCapReached(accrued, totalArthaMinted);
         }
 
-        pos.rewardDebt = _currentAcc(_vault);
+        _restampDebt(_vault, pos, _currentAcc(_vault));
     }
 
     // ═════════════════════════════ staking ══════════════════════════════════════
@@ -190,7 +190,7 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
         require(received == amount, "NO_SHARES_RECEIVED");
 
         Position storage pos = _position[vault][user];
-        pos.shares += received;
+        _addShares(vault, pos, received);
 
         emit Staked(vault, user, msg.sender, received, pos.shares);
     }
@@ -208,7 +208,7 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
 
         Position storage pos = _position[vault][msg.sender];
         require(pos.shares >= amount, "INSUFFICIENT_STAKE");
-        pos.shares -= amount;
+        _removeShares(vault, pos, amount);
 
         IERC20(_vaultInfo[vault].shareToken).safeTransfer(msg.sender, amount);
         emit Unstaked(vault, msg.sender, amount, pos.shares);
@@ -229,7 +229,7 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
         uint256 amount = pos.shares;
         require(amount != 0, "NO_STAKE");
 
-        pos.shares = 0;
+        _removeShares(vault, pos, amount);
 
         IERC20(_vaultInfo[vault].shareToken).safeTransfer(msg.sender, amount);
         emit Unstaked(vault, msg.sender, amount, 0);
@@ -316,9 +316,30 @@ contract UserRewardVault is UserRewardSystem, ReentrancyGuard {
         return MAX_ARTHA - totalArthaMinted;
     }
 
-    /// @notice What this contract still owes stakers.
+    /// @notice What this contract still owes stakers — SETTLED debt plus accrual that
+    ///         has been earned but not yet banked by a `_settle`.
+    ///
+    ///  The unsettled half matters: a staker who simply holds a position earns real
+    ///  ARTHA continuously, and `totalArthaMinted` only moves when they touch the
+    ///  contract. Counting only the settled half would report zero owed for a vault
+    ///  full of long-term stakers, and `rescue` would happily withdraw the ARTHA that
+    ///  is about to be claimed.
+    ///
+    ///  The unsettled figure is clamped to the programme's remaining budget, because
+    ///  that is exactly the clamp `_settle` will apply when it banks it.
     function outstandingArtha() public view returns (uint256) {
-        return totalArthaMinted - totalArthaClaimed;
+        uint256 settled = totalArthaMinted - totalArthaClaimed;
+
+        uint256 unsettled;
+        uint256 n = registeredVaults.length;
+        for (uint256 i; i < n; ++i) {
+            unsettled += _unsettledAccrual(registeredVaults[i]);
+        }
+
+        uint256 budgetLeft = MAX_ARTHA - totalArthaMinted;
+        if (unsettled > budgetLeft) unsettled = budgetLeft;
+
+        return settled + unsettled;
     }
 
     function vaultInfo(address vault) external view returns (VaultInfo memory) {

@@ -116,6 +116,22 @@ contract UserRewardSystem is UserRewardManager {
     /// @notice vault => user => staked position.
     mapping(address => mapping(address => Position)) internal _position;
 
+    /// @notice vault => total shares currently staked across every position.
+    mapping(address => uint256) internal _totalStaked;
+
+    /// @notice vault => Σ over positions of `shares × rewardDebt`, 1e18-scaled.
+    ///
+    ///  Kept alongside `_totalStaked` so the ACCRUED-BUT-UNSETTLED debt of a whole vault
+    ///  can be read in O(1):
+    ///
+    ///      unsettled = (totalStaked × accNow − Σ shares·rewardDebt) / 1e18
+    ///
+    ///  which is exactly `Σ _accruedSince(user)` without iterating users. Without it,
+    ///  the only debt the contract can see is what `_settle` has already banked — and a
+    ///  staker who merely HOLDS a position accrues real, owed ARTHA that would be
+    ///  invisible to `outstandingArtha()`, and therefore rescuable out from under them.
+    mapping(address => uint256) internal _weightedDebt;
+
     event RewardRateUpdated(address indexed vault, uint256 oldRate, uint256 newRate);
 
     constructor(address _admin) UserRewardManager(_admin) {}
@@ -159,6 +175,48 @@ contract UserRewardSystem is UserRewardManager {
         if (acc <= pos.rewardDebt) return 0;
 
         return (pos.shares * (acc - pos.rewardDebt)) / 1e18;
+    }
+
+    /// @dev Accrued-but-unsettled ARTHA across EVERY position in one vault, computed in
+    ///      O(1) from the two running sums. Uncapped by the programme budget — the
+    ///      caller applies that clamp, exactly as `_settle` does per position.
+    function _unsettledAccrual(address _vault) internal view returns (uint256) {
+        uint256 staked = _totalStaked[_vault];
+        if (staked == 0) return 0;
+
+        uint256 gross = staked * _currentAcc(_vault);
+        uint256 debt = _weightedDebt[_vault];
+        if (gross <= debt) return 0;
+
+        return (gross - debt) / 1e18;
+    }
+
+    /// @dev Move a position's `rewardDebt` to `newDebt`, keeping `_weightedDebt` in
+    ///      step. Every write to `rewardDebt` must go through here.
+    function _restampDebt(address _vault, Position storage pos, uint256 newDebt) internal {
+        uint256 shares = pos.shares;
+        if (shares != 0) {
+            _weightedDebt[_vault] = _weightedDebt[_vault] + shares * newDebt - shares * pos.rewardDebt;
+        }
+        pos.rewardDebt = newDebt;
+    }
+
+    /// @dev Credit `amount` shares to a position that is already settled (so its
+    ///      `rewardDebt` equals the live index).
+    function _addShares(address _vault, Position storage pos, uint256 amount) internal {
+        pos.shares += amount;
+        _totalStaked[_vault] += amount;
+        _weightedDebt[_vault] += amount * pos.rewardDebt;
+    }
+
+    /// @dev Remove `amount` shares from a position, at whatever `rewardDebt` it
+    ///      currently carries — settled or not, so the emergency path can use it too.
+    function _removeShares(address _vault, Position storage pos, uint256 amount) internal {
+        pos.shares -= amount;
+        _totalStaked[_vault] -= amount;
+        uint256 weight = amount * pos.rewardDebt;
+        uint256 current = _weightedDebt[_vault];
+        _weightedDebt[_vault] = current > weight ? current - weight : 0;
     }
 
     /// @dev Permanently bank the current rate's contribution up to now, before
