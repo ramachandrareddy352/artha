@@ -171,6 +171,42 @@ library LibStrategyRegistry {
         _creditDivest(s, strategy, freed);
     }
 
+    /// @notice Best-effort `fullExit`: a strategy that cannot be unwound contributes 0
+    ///         instead of reverting the caller.
+    ///
+    ///         Used by `removeStrategy` for a strategy the vault has ALREADY written
+    ///         down (circuit-broken). Without it, a venue that reverts on redeem — a
+    ///         dead, migrated or permanently paused one — makes the strategy impossible
+    ///         to remove, which strands its stale `lastValue` in NAV forever and leaves
+    ///         governance with no way to retire it. The escape hatch must not be
+    ///         blocked by exactly the failure it exists to escape.
+    function tryFullExit(address strategy) internal returns (bool ok, uint256 freed) {
+        VaultStorage.Layout storage s = VaultStorage.vaultLayout();
+        IERC20 base = IERC20(s.baseAsset);
+
+        address receipt;
+        try IStrategy(strategy).receiptToken() returns (address r) {
+            receipt = r;
+        } catch {
+            emit StrategyDivestFailed(strategy);
+            s.strategyLastValue[strategy] = 0;
+            return (false, 0);
+        }
+
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, type(uint256).max);
+        uint256 beforeBal = base.balanceOf(address(this));
+        try IStrategy(strategy).emergencyWithdraw() {
+            freed = base.balanceOf(address(this)) - beforeBal;
+            ok = true;
+        } catch {
+            emit StrategyDivestFailed(strategy);
+        }
+        if (receipt != address(0)) IERC20(receipt).forceApprove(strategy, 0);
+
+        if (freed != 0) s.idleBalance += freed;
+        s.strategyLastValue[strategy] = 0;
+    }
+
     /// @notice Fully unwind a strategy's position to base (emergency path — no
     ///         harvest, no slippage bound), crediting the proceeds to idle.
     function fullExit(address strategy) internal returns (uint256 freed) {
@@ -217,9 +253,64 @@ library LibStrategyRegistry {
         }
         require(list.length < MAX_STRATEGIES_PER_VAULT, "MAX_STRATEGIES");
 
+        _requireExclusiveReceipt(s, strategy, address(0));
+
         list.push(strategy);
 
         setTargets(allStrategies, allWeightsBps, idleTargetBps);
+    }
+
+    /// @notice A strategy's declared receipt must be a token NOTHING ELSE in this vault
+    ///         owns — not the base asset, not the share token, and not another
+    ///         strategy's receipt.
+    ///
+    ///  ═══════════════════════════════════════════════════════════════════════════
+    ///   WHY THIS IS A SECURITY CHECK, NOT A TIDINESS ONE
+    ///  ═══════════════════════════════════════════════════════════════════════════
+    ///
+    ///  `divestFrom` / `tryDivestFrom` / `fullExit` grant a strategy an allowance over
+    ///  whatever `receiptToken()` it names, so that it can redeem the position it holds
+    ///  on the vault's behalf. That declaration is SELF-REPORTED. Without this check, a
+    ///  strategy could name a token it does not own — another strategy's aToken, 4626
+    ///  share, LST or PT — and the vault would hand it an allowance over the VAULT'S
+    ///  ENTIRE HOLDING of that token, which it can transfer out during its own
+    ///  `divest`. That turns "a bad strategy loses its own allocation" into "a bad
+    ///  strategy drains every other strategy", which is the one boundary this system
+    ///  must not lose.
+    ///
+    ///  It also closes a NAV bug that has nothing to do with malice: two honest
+    ///  strategies sharing a receipt (two wrappers over the same 4626, two Aave
+    ///  adapters on one market) would EACH report the vault's whole balance of it as
+    ///  their position, double-counting it into `totalAssets`.
+    ///
+    /// @param exclude A strategy to skip when scanning — the one being replaced by
+    ///        `migrateStrategy`, which frees its receipt before the replacement lands,
+    ///        so migrating between two adapters on the SAME venue stays possible.
+    /// @dev   `address(0)` means "internal-ledger venue, no transferable receipt"
+    ///        (Compound III, Convex, the rotation strategies). Nothing is ever approved
+    ///        for those, so any number of them may coexist.
+    function _requireExclusiveReceipt(VaultStorage.Layout storage s, address strategy, address exclude) private view {
+        address receipt;
+        try IStrategy(strategy).receiptToken() returns (address r) {
+            receipt = r;
+        } catch {
+            revert("RECEIPT_READ_FAILED");
+        }
+        if (receipt == address(0)) return;
+
+        require(receipt != s.baseAsset, "RECEIPT_IS_BASE_ASSET");
+        require(receipt != s.shareToken, "RECEIPT_IS_SHARE_TOKEN");
+
+        address[] storage list = s.strategies;
+        for (uint256 i; i < list.length; i++) {
+            address other = list[i];
+            if (other == exclude) continue;
+            try IStrategy(other).receiptToken() returns (address r) {
+                require(r != receipt, "RECEIPT_COLLISION");
+            } catch {
+                continue;
+            }
+        }
     }
 
     function setTargets(address[] memory strategies_, uint16[] memory weightsBps, uint16 idleTargetBps) internal {
@@ -314,9 +405,12 @@ library LibStrategyRegistry {
             // exactly that amount until someone happened to call `sync()`.
             (bool ok,) = harvestInto(strategy);
             require(ok, "HARVEST_FAILED");
+            fullExit(strategy);
+        } else {
+            // Already written down, so a failed unwind is a loss governance has
+            // accepted rather than a reason to be stuck with the strategy forever.
+            tryFullExit(strategy);
         }
-
-        fullExit(strategy);
 
         uint256 remaining = s.strategyBroken[strategy] ? 0 : IStrategy(strategy).positionValue();
         uint256 dust = remaining <= dustFloor ? remaining : 0;
@@ -343,6 +437,10 @@ library LibStrategyRegistry {
         for (uint256 i; i < list.length; i++) {
             require(list[i] != to, "ALREADY_ADDED");
         }
+
+        // `from` is excluded: it is fully exited and dropped below, so a migration
+        // between two adapters over the SAME venue is legitimate.
+        _requireExclusiveReceipt(s, to, from);
 
         if (!s.strategyBroken[from]) {
             // See removeStrategy: credit the proceeds. Beyond the NAV understatement,
