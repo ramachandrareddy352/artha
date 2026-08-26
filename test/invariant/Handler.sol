@@ -12,6 +12,7 @@ import {AdminFacet} from "../../src/facets/AdminFacet.sol";
 import {EmergencyFacet} from "../../src/facets/EmergencyFacet.sol";
 import {ViewFacet} from "../../src/facets/ViewFacet.sol";
 import {MockERC20, MockERC4626} from "../mocks/Mocks.sol";
+import {EvilStrategy} from "../attack/EvilStrategy.sol";
 
 contract Handler is Test {
     Vault public immutable vault;
@@ -27,6 +28,9 @@ contract Handler is Test {
 
     address[] public actors;
     address internal currentActor;
+
+    EvilStrategy public evil;
+    bool public evilRegistered;
 
     uint256 public totalDeposited;
     uint256 public totalWithdrawn;
@@ -162,6 +166,70 @@ contract Handler is Test {
     function venueIlliquidity(uint256 which, uint256 cap) external {
         MockERC4626 v = which % 2 == 0 ? venueA : venueB;
         v.setLiquidityCap(bound(cap, 0, type(uint128).max));
+    }
+
+    function venueRevert(uint256 which, bool on) external {
+        MockERC4626 v = which % 2 == 0 ? venueA : venueB;
+        v.setRevertOnWithdraw(on);
+    }
+
+    function setEvil(EvilStrategy _evil) external {
+        evil = _evil;
+    }
+
+    function evilValueMode(uint256 mode) external {
+        if (address(evil) == address(0)) return;
+        evil.setValueMode(EvilStrategy.ValueMode(bound(mode, 0, 4)));
+    }
+
+    function evilMisbehave(uint256 mode) external {
+        if (address(evil) == address(0)) return;
+        evil.setMisbehaviour(EvilStrategy.Misbehaviour(bound(mode, 0, 4)));
+    }
+
+    function addEvilStrategy(uint256 weightSeed) external {
+        if (address(evil) == address(0) || evilRegistered) return;
+
+        uint16 wEvil = uint16(bound(weightSeed, 500, 4_000));
+        uint16 rest = 9_000 - wEvil;
+
+        address[] memory all = new address[](3);
+        all[0] = stratA;
+        all[1] = stratB;
+        all[2] = address(evil);
+        uint16[] memory w = new uint16[](3);
+        w[0] = rest / 2;
+        w[1] = rest - rest / 2;
+        w[2] = wEvil;
+
+        vm.prank(gov);
+        try AdminFacet(payable(address(vault))).addStrategy(address(evil), all, w, 1_000) {
+            evilRegistered = true;
+        } catch {}
+    }
+
+    function removeEvilStrategy() external {
+        if (!evilRegistered) return;
+
+        vm.prank(gov);
+        try AdminFacet(payable(address(vault))).removeStrategy(address(evil), type(uint256).max) {
+            evilRegistered = false;
+            address[] memory all = new address[](2);
+            all[0] = stratA;
+            all[1] = stratB;
+            uint16[] memory w = new uint16[](2);
+            w[0] = 4_500;
+            w[1] = 4_500;
+            vm.prank(gov);
+            try AdminFacet(payable(address(vault))).setTargets(all, w, 1_000) {} catch {}
+        } catch {}
+    }
+
+    function clearBreaker(uint256 which) external {
+        address strat = which % 2 == 0 ? stratA : stratB;
+        (,, uint256 lastValue) = ViewFacet(payable(address(vault))).strategyStatus(strat);
+        vm.prank(gov);
+        try AdminFacet(payable(address(vault))).clearStrategyCircuitBreak(strat, lastValue) {} catch {}
     }
 
     function reweight(uint256 weightSeed) external {
