@@ -29,6 +29,12 @@ abstract contract VaultHarness is Test {
     IERC20 internal base;
 
     function _deployVault(address baseAsset, uint16 idleTargetBps, uint16 maxDeltaBps) internal {
+        _deployVaultWithTreasury(baseAsset, idleTargetBps, maxDeltaBps, TREASURY);
+    }
+
+    function _deployVaultWithTreasury(address baseAsset, uint16 idleTargetBps, uint16 maxDeltaBps, address treasury_)
+        internal
+    {
         Vault.Facets memory f = Vault.Facets({
             deposit: address(new DepositFacet()),
             withdraw: address(new WithdrawFacet()),
@@ -41,7 +47,7 @@ abstract contract VaultHarness is Test {
         Vault.InitConfig memory c = Vault.InitConfig({
             baseAsset: baseAsset,
             governance: GOV,
-            treasury: TREASURY,
+            treasury: treasury_,
             keeper: KEEPER,
             guardian: GUARDIAN,
             idleTargetBps: idleTargetBps,
