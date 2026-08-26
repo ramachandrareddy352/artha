@@ -28,6 +28,39 @@ contract MockERC20 is ERC20 {
     }
 }
 
+/// Takes a cut on every transfer, so the recipient receives less than was sent.
+contract FeeOnTransferToken is ERC20 {
+    uint8 private immutable _decimals;
+    uint256 public feeBps;
+
+    constructor(string memory n, string memory s, uint8 d, uint256 _feeBps) ERC20(n, s) {
+        _decimals = d;
+        feeBps = _feeBps;
+    }
+
+    function decimals() public view override returns (uint8) {
+        return _decimals;
+    }
+
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
+    function setFeeBps(uint256 _feeBps) external {
+        feeBps = _feeBps;
+    }
+
+    function _update(address from, address to, uint256 value) internal override {
+        if (from == address(0) || to == address(0) || feeBps == 0) {
+            super._update(from, to, value);
+            return;
+        }
+        uint256 fee = (value * feeBps) / 10_000;
+        super._update(from, to, value - fee);
+        if (fee != 0) super._update(from, address(0xFEE), fee);
+    }
+}
+
 contract MockOracle {
     mapping(address => uint256) private _prices;
     mapping(address => bool) private _reverts;
@@ -102,6 +135,8 @@ contract MockERC4626 is ERC20 {
     uint8 private immutable _decimals;
     uint256 public rate = 1e18;
     uint256 public liquidityCap = type(uint256).max;
+    bool public revertOnWithdraw;
+    bool public revertOnConvert;
 
     constructor(address _asset) ERC20("Mock 4626", "m4626") {
         assetToken = IERC20(_asset);
@@ -128,7 +163,16 @@ contract MockERC4626 is ERC20 {
         liquidityCap = cap;
     }
 
+    function setRevertOnWithdraw(bool on) external {
+        revertOnWithdraw = on;
+    }
+
+    function setRevertOnConvert(bool on) external {
+        revertOnConvert = on;
+    }
+
     function convertToAssets(uint256 shares) public view returns (uint256) {
+        require(!revertOnConvert, "VENUE_DOWN");
         return Math.mulDiv(shares, rate, 1e18);
     }
 
@@ -148,6 +192,7 @@ contract MockERC4626 is ERC20 {
     }
 
     function withdraw(uint256 assets, address receiver, address owner) external returns (uint256 shares) {
+        require(!revertOnWithdraw, "VENUE_FROZEN");
         require(assets <= maxWithdraw(owner), "EXCEEDS_MAX");
         shares = convertToShares(assets);
         if (owner != msg.sender) _spendAllowance(owner, msg.sender, shares);
@@ -156,6 +201,7 @@ contract MockERC4626 is ERC20 {
     }
 
     function redeem(uint256 shares, address receiver, address owner) external returns (uint256 assets) {
+        require(!revertOnWithdraw, "VENUE_FROZEN");
         assets = convertToAssets(shares);
         require(assets <= liquidityCap, "EXCEEDS_MAX");
         if (owner != msg.sender) _spendAllowance(owner, msg.sender, shares);
