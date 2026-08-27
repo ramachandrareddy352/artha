@@ -9,3 +9,6 @@ out/
 
 # Dotenv file
 .env
+
+# Mutation-campaign crash journal (see script/mutation.py)
+.mutation-journal
