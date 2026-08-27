@@ -335,16 +335,20 @@ contract MockCurvePool {
     }
 
     function add_liquidity(uint256[3] calldata amounts, uint256 minMint) external {
-        _add(amounts[0], amounts[1], amounts[2], minMint, 3);
+        _add(amounts[0], amounts[1], amounts[2], 0, minMint, 3);
     }
 
     function add_liquidity(uint256[2] calldata amounts, uint256 minMint) external {
-        _add(amounts[0], amounts[1], 0, minMint, 2);
+        _add(amounts[0], amounts[1], 0, 0, minMint, 2);
     }
 
-    function _add(uint256 a0, uint256 a1, uint256 a2, uint256 minMint, uint256 n) private {
+    function add_liquidity(uint256[4] calldata amounts, uint256 minMint) external {
+        _add(amounts[0], amounts[1], amounts[2], amounts[3], minMint, 4);
+    }
+
+    function _add(uint256 a0, uint256 a1, uint256 a2, uint256 a3, uint256 minMint, uint256 n) private {
         uint256 minted;
-        uint256[3] memory amounts = [a0, a1, a2];
+        uint256[4] memory amounts = [a0, a1, a2, a3];
         for (uint256 i; i < n; ++i) {
             if (amounts[i] == 0) continue;
             IERC20(coinList[i]).safeTransferFrom(msg.sender, address(this), amounts[i]);
