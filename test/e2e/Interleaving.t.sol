@@ -126,8 +126,8 @@ contract PermutationTest is VaultHarness {
         uint256 claims = _claim(alice) + _claim(bob) + _claim(carol) + _claim(TREASURY);
         assertLe(claims, _totalAssets() + 4);
 
-        uint256 sum = _shareToken().balanceOf(alice) + _shareToken().balanceOf(bob)
-            + _shareToken().balanceOf(carol) + _shareToken().balanceOf(TREASURY);
+        uint256 sum = _shareToken().balanceOf(alice) + _shareToken().balanceOf(bob) + _shareToken().balanceOf(carol)
+            + _shareToken().balanceOf(TREASURY);
         assertEq(sum, _shareToken().totalSupply());
 
         address[] memory strats = _strategyList();
